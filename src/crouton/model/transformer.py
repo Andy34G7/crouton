@@ -111,11 +111,10 @@ class CroutonForCausalLM(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> CroutonOutput:
         _, seq_len = input_ids.shape
-        x = self.tok_emb(input_ids)
-        rope_dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
-        cos, sin = self.rope(seq_len, dtype=rope_dtype)
+        device = input_ids.device
 
-        # Check all-ones padding mask once per model call instead of repeating inside every layer.
+        # Check all-ones padding mask and fetch any @torch.compiler.disable FlexAttention mask
+        # before entering embedding/RoPE/transformer tensor ops so compiled graphs stay contiguous.
         if attention_mask is not None and not torch.compiler.is_compiling() and bool(attention_mask.all().item()):
             attention_mask = None
 
@@ -123,19 +122,19 @@ class CroutonForCausalLM(nn.Module):
         global_padded_mask = None
         swa_padded_mask = None
         if attention_mask is None and self._has_swa_layers:
-            if self._needs_flex_swa_mask and _supports_cuda_flex_attention(x.device, seq_len):
+            if self._needs_flex_swa_mask and _supports_cuda_flex_attention(device, seq_len):
                 swa_block_mask = _get_cached_swa_block_mask(
                     seq_len=seq_len,
                     window_size=self.config.sliding_window,
                     sink_tokens=self.config.sink_tokens,
-                    device=x.device,
+                    device=device,
                 )
             else:
                 swa_padded_mask = build_swa_sink_mask(
                     seq_len=seq_len,
                     window_size=self.config.sliding_window,
                     sink_tokens=self.config.sink_tokens,
-                    device=x.device,
+                    device=device,
                 )
         elif attention_mask is not None:
             if self._has_global_layers:
@@ -146,6 +145,10 @@ class CroutonForCausalLM(nn.Module):
                 swa_padded_mask = build_padded_attn_mask(
                     attention_mask, seq_len, is_global=False, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
                 )
+
+        x = self.tok_emb(input_ids)
+        rope_dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
+        cos, sin = self.rope(seq_len, dtype=rope_dtype)
 
         entropies = []
         for block in self.blocks:
@@ -158,8 +161,9 @@ class CroutonForCausalLM(nn.Module):
                 swa_block_mask=swa_block_mask,
                 precomputed_mask=layer_mask,
             )
-            rw_f = rw.float().clamp(min=1e-8)
-            entropies.append(-(rw_f * rw_f.log()).sum(dim=-1).mean())
+            with torch.no_grad():
+                rw_f = rw.float().clamp(min=1e-8)
+                entropies.append(-(rw_f * rw_f.log()).sum(dim=-1).mean())
 
         x = self.final_norm(x)
         if self.lm_head is None:
@@ -174,7 +178,7 @@ class CroutonForCausalLM(nn.Module):
         loss = None
         if targets is not None:
             flat_logits = logits.float().view(-1, logits.size(-1))
-            flat_targets = targets.view(-1)
+            flat_targets = targets.reshape(-1)
             valid_mask = flat_targets != -100
             safe_targets = torch.where(valid_mask, flat_targets, 0)
             tok_loss = F.cross_entropy(flat_logits, safe_targets, reduction="none")

@@ -48,6 +48,9 @@ class _TokenizerCompat:
         self.unk_token = None
         self.unk_token_id = None
 
+    def encode(self, text: str, **kwargs) -> list[int]:
+        return list(self._tokenizer.encode(text))
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._tokenizer, name)
 
@@ -62,20 +65,28 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         batch_size: int = 1,
         max_gen_toks: int = 256,
         device: str | None = None,
+        bf16: bool = True,
     ) -> None:
+        if batch_size < 1 or max_gen_toks < 1:
+            raise ValueError("batch_size and max_gen_toks must be >= 1")
         resolved_device = torch.device(device) if device else get_device()
         if HAS_LM_EVAL:
             super().__init__()
         self._device = resolved_device
+        self._bf16 = bf16
         self.model, self.model_cfg, _ = load_checkpoint(checkpoint_path, device=self._device)
         self.model.eval()
         raw_tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
         validate_tokenizer_vocab(raw_tokenizer, self.model_cfg)
         self._eot_id = resolve_token_id(raw_tokenizer, "<|endoftext|>", fallback=0)
+        self._im_end_id = resolve_token_id(raw_tokenizer, "<|im_end|>", fallback=self._eot_id)
         self.tokenizer = _TokenizerCompat(raw_tokenizer, tokenizer_path=tokenizer_path, eot_id=self._eot_id)
         self._tokenizer_path = tokenizer_path
         self._batch_size = batch_size
         self._max_gen_toks = max_gen_toks
+
+    def _amp_ctx(self):
+        return torch.amp.autocast("cuda", dtype=torch.bfloat16) if (self._bf16 and bf16_supported(self.device)) else nullcontext()
 
     @property
     def tokenizer_name(self) -> str:
@@ -128,9 +139,7 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         x = torch.tensor([full[:-1]], dtype=torch.long, device=self.device)
         y = torch.tensor(full[1:], dtype=torch.long, device=self.device)
 
-        use_bf16 = bf16_supported(self.device)
-        amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
-        with amp_ctx:
+        with self._amp_ctx():
             logits = self.model(x).logits[0]  # [T, V]
 
         cont_logits = logits[-cont_len:].float()
@@ -140,12 +149,68 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         is_greedy = bool((cont_logits.argmax(dim=-1) == cont_targets).all().item())
         return float(tok_logps.sum().item()), is_greedy
 
+    @torch.no_grad()
+    def _score_long_pair(self, ctx_ids: list[int], cont_ids: list[int]) -> tuple[float, bool]:
+        first_take = min(
+            len(cont_ids),
+            max(1, self.max_length - len(ctx_ids)) if len(ctx_ids) < self.max_length else max(1, self.max_length // 2),
+        )
+        ll_total, all_greedy = self._score_pair(ctx_ids, cont_ids[:first_take])
+        ids = ctx_ids + cont_ids
+        pos = len(ctx_ids) + first_take
+        stride = max(1, self.max_length // 2)
+        while pos < len(ids):
+            end = min(len(ids), pos + stride)
+            chunk_cont = ids[pos:end]
+            ctx_start = max(0, pos - max(1, self.max_length + 1 - len(chunk_cont)))
+            chunk_ll, chunk_greedy = self._score_pair(ids[ctx_start:pos], chunk_cont)
+            ll_total += chunk_ll
+            all_greedy = all_greedy and chunk_greedy
+            pos = end
+        return ll_total, all_greedy
+
+    @torch.no_grad()
+    def _score_batch(self, pairs: list[tuple[list[int], list[int]]]) -> list[tuple[float, bool]]:
+        if len(pairs) == 1:
+            return [self._score_pair(*pairs[0])]
+        seqs: list[tuple[list[int], list[int], int]] = []
+        max_t = 1
+        for ctx_ids, cont_ids in pairs:
+            full = (ctx_ids + cont_ids)[-(self.max_length + 1) :]
+            cont_len = min(len(cont_ids), len(full) - 1)
+            seqs.append((full[:-1], full[1:], cont_len))
+            max_t = max(max_t, len(full) - 1)
+
+        bsz = len(seqs)
+        x_batch = torch.full((bsz, max_t), self.eot_token_id, dtype=torch.long, device=self.device)
+        mask = torch.zeros((bsz, max_t), dtype=torch.bool, device=self.device)
+        for i, (inp, _, _) in enumerate(seqs):
+            n = len(inp)
+            x_batch[i, :n] = torch.tensor(inp, dtype=torch.long, device=self.device)
+            mask[i, :n] = True
+
+        attn_mask = None if bool(mask.all().item()) else mask
+        with self._amp_ctx():
+            logits = self.model(x_batch, attention_mask=attn_mask).logits
+
+        out: list[tuple[float, bool]] = []
+        for i, (_, tgt_list, cont_len) in enumerate(seqs):
+            seq_len = len(tgt_list)
+            cont_logits = logits[i, seq_len - cont_len : seq_len].float()
+            cont_targets = torch.tensor(tgt_list[-cont_len:], dtype=torch.long, device=self.device)
+            log_probs = F.log_softmax(cont_logits, dim=-1)
+            tok_logps = torch.gather(log_probs, dim=-1, index=cont_targets.unsqueeze(-1)).squeeze(-1)
+            is_greedy = bool((cont_logits.argmax(dim=-1) == cont_targets).all().item())
+            out.append((float(tok_logps.sum().item()), is_greedy))
+        return out
+
     def loglikelihood(self, requests) -> list[tuple[float, bool]]:
-        results: list[tuple[float, bool]] = []
-        for req in requests:
+        results: list[tuple[float, bool] | None] = [None] * len(requests)
+        short_items: list[tuple[int, list[int], list[int]]] = []
+        for idx, req in enumerate(requests):
             ctx, cont = req.args
             if not cont:
-                results.append((0.0, True))
+                results[idx] = (0.0, True)
                 continue
 
             if not ctx:
@@ -168,8 +233,21 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
                 else:
                     ctx_ids = ctx_ids[: max(0, prefix - 1)] or [self.eot_token_id]
                     cont_ids = whole_ids[-1:]
-            results.append(self._score_pair(ctx_ids, cont_ids))
-        return results
+
+            if not cont_ids or (len(ctx_ids) + len(cont_ids)) < 2:
+                results[idx] = (0.0, True)
+            elif len(cont_ids) > self.max_length:
+                results[idx] = self._score_long_pair(ctx_ids, cont_ids)
+            else:
+                short_items.append((idx, ctx_ids, cont_ids))
+
+        for start in range(0, len(short_items), self.batch_size):
+            chunk = short_items[start : start + self.batch_size]
+            scores = self._score_batch([(c_ids, t_ids) for _, c_ids, t_ids in chunk])
+            for (orig_idx, _, _), score in zip(chunk, scores):
+                results[orig_idx] = score
+
+        return [r if r is not None else (0.0, True) for r in results]
 
     def loglikelihood_rolling(self, requests) -> list[float]:
         results: list[float] = []
@@ -202,8 +280,9 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
 
     def generate_until(self, requests) -> list[str]:
         outputs: list[str] = []
-        use_bf16 = bf16_supported(self.device)
-        amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
+        amp_ctx = self._amp_ctx()
+        gen_eos = list(dict.fromkeys([self._eot_id, self._im_end_id]))
+        eos_set = set(gen_eos)
         for req in requests:
             ctx, gen_kwargs = req.args
             kwargs = gen_kwargs if isinstance(gen_kwargs, dict) else {}
@@ -236,11 +315,11 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
                     max_new_tokens=max_toks,
                     temperature=temp,
                     top_k=top_k,
-                    eos_token_ids=[self.eot_token_id],
+                    eos_token_ids=gen_eos,
                     vocab_limit=self.tokenizer.vocab_size,
                 )
             gen_ids = seq[0, x.size(1) :].tolist()
-            if gen_ids and gen_ids[-1] == self.eot_token_id:
+            while gen_ids and gen_ids[-1] in eos_set:
                 gen_ids = gen_ids[:-1]
             text = self.tok_decode(gen_ids)
             stop_indices = [text.find(stop) for stop in until if stop and stop in text]
@@ -256,6 +335,7 @@ def evaluate_bpb(
     tokenizer_path: str,
     texts: list[str],
     seq_len: int | None = None,
+    bf16: bool = True,
 ) -> dict[str, float]:
     """
     Compute tokenizer-agnostic Bits-Per-Byte (BPB) and Perplexity (PPL)
@@ -269,7 +349,8 @@ def evaluate_bpb(
         raise ValueError("seq_len must be >= 1")
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
-    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if bf16_supported(device) else nullcontext()
+    use_bf16 = bf16 and bf16_supported(device)
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
     return evaluate_model_bpb(model, tokenizer, texts, eff_seq_len, device, amp_ctx)
 
 
@@ -279,10 +360,15 @@ def evaluate_lm_eval(
     tasks: list[str],
     limit: int | None = None,
     batch_size: int = 1,
+    bf16: bool = True,
 ) -> dict[str, Any]:
+    if batch_size < 1 or (limit is not None and limit < 1):
+        raise ValueError("batch_size and limit must be >= 1")
+    if not tasks:
+        raise ValueError("tasks must be non-empty")
     if not HAS_LM_EVAL:
         raise RuntimeError("lm-eval is not installed. Install with: uv sync --extra dev --extra eval")
-    lm = CroutonLM(checkpoint_path=checkpoint_path, tokenizer_path=tokenizer_path, batch_size=batch_size)
+    lm = CroutonLM(checkpoint_path=checkpoint_path, tokenizer_path=tokenizer_path, batch_size=batch_size, bf16=bf16)
     results = lm_eval.simple_evaluate(model=lm, tasks=tasks, limit=limit)
     return results.get("results", {})
 
@@ -297,29 +383,45 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=None, help="Override BPB seq_len (defaults to checkpoint max_seq_len)")
+    parser.add_argument("--no-bf16", action="store_true")
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
 
     if not args.val_file and not args.tasks:
         parser.error("Provide at least one of --val-file or --tasks")
+    if args.batch_size < 1 or (args.limit is not None and args.limit < 1) or (args.seq_len is not None and args.seq_len < 1):
+        parser.error("--batch-size, --limit, and --seq-len must all be >= 1")
 
-    report: dict[str, Any] = {"primary": {}}
+    texts: list[str] | None = None
     if args.val_file:
         texts = [line.strip() for line in Path(args.val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
-        report["primary"]["bpb"] = evaluate_bpb(args.checkpoint, args.tokenizer, texts, seq_len=args.seq_len)
+        if not texts:
+            raise ValueError(f"Validation file {args.val_file!r} contains no non-empty lines")
+
+    task_list: list[str] = []
+    if args.tasks is not None:
+        task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        if not task_list:
+            parser.error("--tasks must contain at least one non-empty task name")
+
+    use_bf16 = not args.no_bf16
+    report: dict[str, Any] = {"primary": {}}
+    if texts is not None:
+        report["primary"]["bpb"] = evaluate_bpb(
+            args.checkpoint, args.tokenizer, texts, seq_len=args.seq_len, bf16=use_bf16
+        )
         if args.compare_checkpoint:
             report.setdefault("compare", {})["bpb"] = evaluate_bpb(
-                args.compare_checkpoint, args.tokenizer, texts, seq_len=args.seq_len
+                args.compare_checkpoint, args.tokenizer, texts, seq_len=args.seq_len, bf16=use_bf16
             )
 
-    if args.tasks:
-        task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    if task_list:
         report["primary"]["lm_eval"] = evaluate_lm_eval(
-            args.checkpoint, args.tokenizer, task_list, limit=args.limit, batch_size=args.batch_size
+            args.checkpoint, args.tokenizer, task_list, limit=args.limit, batch_size=args.batch_size, bf16=use_bf16
         )
         if args.compare_checkpoint:
             report.setdefault("compare", {})["lm_eval"] = evaluate_lm_eval(
-                args.compare_checkpoint, args.tokenizer, task_list, limit=args.limit, batch_size=args.batch_size
+                args.compare_checkpoint, args.tokenizer, task_list, limit=args.limit, batch_size=args.batch_size, bf16=use_bf16
             )
 
     print(json.dumps(report, indent=2))

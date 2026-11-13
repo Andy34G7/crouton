@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from crouton.config import CroutonConfig
-from crouton.model import CroutonForCausalLM, build_swa_sink_mask
+from crouton.model import CroutonForCausalLM, HybridSparseAttention, build_swa_sink_mask
 from crouton.model.rope import apply_rope
 
 
@@ -122,13 +122,30 @@ def test_yaml_configs_instantiate():
         assert cfg.is_global_layer(cfg.n_layers - 1)
 
 
-def test_model_config_validation_and_optional_flags():
-    with pytest.raises(ValueError, match="max_seq_len"):
-        CroutonConfig(max_seq_len=0)
-    with pytest.raises(ValueError, match="d_model"):
-        CroutonConfig(d_model=65, n_heads=4)
-    with pytest.raises(ValueError, match="n_heads"):
-        CroutonConfig(n_heads=4, n_kv_heads=3)
+def test_model_config_validation_and_optional_flags(tmp_path):
+    for bad_kwargs in (
+        {"max_seq_len": 0},
+        {"d_model": 0},
+        {"n_layers": 0},
+        {"n_heads": 0},
+        {"n_kv_heads": 0},
+        {"d_ff": 0},
+        {"rope_theta": 1.0},
+        {"d_model": 65, "n_heads": 4},
+        {"n_heads": 4, "n_kv_heads": 3},
+    ):
+        with pytest.raises(ValueError):
+            CroutonConfig(**bad_kwargs)
+
+    empty_yaml = tmp_path / "empty.yaml"
+    empty_yaml.write_text("# comment only\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="mapping"):
+        CroutonConfig.from_yaml(empty_yaml)
+
+    bad_yaml = tmp_path / "bad.yaml"
+    bad_yaml.write_text("unknown_field: 123\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid"):
+        CroutonConfig.from_yaml(bad_yaml)
 
     cfg = CroutonConfig(
         vocab_size=128,
@@ -149,17 +166,37 @@ def test_model_config_validation_and_optional_flags():
         router_jitter=0.05,
         use_flex_attention=False,
     )
+    yaml_roundtrip = tmp_path / "cfg.yaml"
+    cfg.to_yaml(yaml_roundtrip)
+    assert CroutonConfig.from_yaml(yaml_roundtrip) == cfg
+
     model = CroutonForCausalLM(cfg)
     assert model.lm_head.weight is not model.tok_emb.weight
+    assert model.num_parameters(exclude_embeddings=False) == sum(p.numel() for p in model.parameters())
+    assert model.num_parameters(exclude_embeddings=True) == model.num_parameters() - model.tok_emb.weight.numel()
+
     model.train()
-    x = torch.randint(0, 128, (2, 8))
-    out = model(x, targets=x)
+    x = torch.randint(0, 128, (2, 9))
+    non_contig_targets = x[:, 1:].clone()
+    out = model(x[:, :-1], targets=non_contig_targets)
     assert out.logits.abs().max().item() <= 30.0 + 1e-4
+    assert out.router_entropy is not None and not out.router_entropy.requires_grad
     out.loss.backward()
 
-    # Check generate() respects vocab_limit and restores prior training mode
+    # Standalone HybridSparseAttention calls (precomputed_mask=None)
+    cos, sin = model.rope(8, dtype=torch.float32)
+    h = torch.randn(2, 8, 64)
+    attn_mask = torch.ones((2, 8), dtype=torch.bool)
+    attn_mask[1, -2:] = False
+    for layer_idx in (0, 1):
+        attn = HybridSparseAttention(cfg, layer_idx=layer_idx)
+        assert attn(h, cos, sin, attention_mask=attn_mask).shape == (2, 8, 64)
+        assert attn(h, cos, sin).shape == (2, 8, 64)
+
+    # Check generate() respects vocab_limit, top_k, max_new_tokens=0, eos=None, and restores training mode
     model.train()
-    gen = model.generate(x[:, :3], max_new_tokens=4, temperature=0.8, eos_token_ids=[127], vocab_limit=64)
+    assert model.generate(x[:, :3], max_new_tokens=0).shape == (2, 3)
+    gen = model.generate(x[:, :3], max_new_tokens=4, temperature=0.8, top_k=4, eos_token_ids=None, vocab_limit=64)
     assert gen.shape == (2, 7)
     assert (gen[:, 3:] < 64).all()
     assert model.training

@@ -466,3 +466,126 @@ def test_utils_and_cli_edge_cases(tmp_path, monkeypatch):
     sft_mod.main()
     assert seen["subset"] is None
     assert seen["seed"] == 123
+
+    # sft --preset smoltalk respects --subset override and rejects conflicting --dataset
+    seen.clear()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "crouton-sft",
+            "--base-checkpoint",
+            str(out_dir / "final.pt"),
+            "--preset",
+            "smoltalk",
+            "--subset",
+            "everyday-conversations",
+        ],
+    )
+    sft_mod.main()
+    assert seen["dataset_name"] == "HuggingFaceTB/smoltalk"
+    assert seen["subset"] == "everyday-conversations"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-sft", "--base-checkpoint", str(out_dir / "final.pt"), "--preset", "smoltalk", "--dataset", "x"],
+    )
+    with pytest.raises(SystemExit):
+        sft_mod.main()
+
+    # Empty val/local files and invalid CLI numeric bounds fail loudly
+    empty_txt = tmp_path / "empty.txt"
+    empty_txt.write_text("  \n\n\t", encoding="utf-8")
+    with pytest.raises(ValueError, match="Evaluation texts"):
+        evaluate_bpb(str(out_dir / "final.pt"), str(tok_path), [])
+    with pytest.raises(ValueError, match="non-empty lines"):
+        run_pretrain(
+            CroutonConfig.from_yaml(cfg_file),
+            TrainConfig(output_dir=str(tmp_path / "e1"), tokenizer_path=str(tok_path), seq_len=8, total_steps=1, micro_batch_size=1, grad_accum_steps=1, warmup_steps=0, decay_steps=0, bf16=False, compile_model=False),
+            val_file=str(empty_txt),
+        )
+    with pytest.raises(ValueError, match="max_examples"):
+        run_sft(
+            str(out_dir / "final.pt"),
+            str(tok_path),
+            str(tmp_path / "e2"),
+            max_examples=0,
+            seq_len=8,
+            total_steps=1,
+            micro_batch_size=1,
+            grad_accum_steps=1,
+        )
+
+    # Zero-supervision preference rows do not inject P=1.0 into DPO/ORPO
+    run_preference_tuning(
+        base_checkpoint=str(out_dir / "final.pt"),
+        tokenizer_path=str(tok_path),
+        output_dir=str(tmp_path / "orpo_zero_sup"),
+        seq_len=16,
+        total_steps=1,
+        micro_batch_size=2,
+        grad_accum_steps=1,
+        use_orpo=True,
+        pairs_override=[
+            {"prompt": [{"role": "user", "content": "Only user"}], "chosen": [{"role": "user", "content": "Only user"}], "rejected": [{"role": "user", "content": "Only user"}]},
+            {"prompt": "Q", "chosen": "Yes", "rejected": "No"},
+        ],
+    )
+    assert (tmp_path / "orpo_zero_sup" / "final.pt").exists()
+
+    # Batched CroutonLM.loglikelihood matches unbatched identically and supports long continuations
+    ckpt_file = str(out_dir / "final.pt")
+    lm1 = CroutonLM(ckpt_file, str(tok_path), batch_size=1, device="cpu", bf16=False)
+    lm2 = CroutonLM(ckpt_file, str(tok_path), batch_size=2, device="cpu", bf16=False)
+    reqs = [
+        SimpleNamespace(args=("Dense", " MoE")),
+        SimpleNamespace(args=("Transformer ", "training text.")),
+        SimpleNamespace(args=("", "Dense MoE")),
+    ]
+    r1 = lm1.loglikelihood(reqs)
+    r2 = lm2.loglikelihood(reqs)
+    for (ll1, g1), (ll2, g2) in zip(r1, r2):
+        assert ll1 == pytest.approx(ll2, abs=1e-5)
+        assert g1 == g2
+    assert lm1.tokenizer.encode("Dense", add_special_tokens=False) == lm1.tok_encode("Dense")
+    long_cont = "Dense MoE transformer training text. " * 4
+    ll_long = lm1.loglikelihood([SimpleNamespace(args=("Start:", long_cont))])
+    assert isinstance(ll_long[0][0], float) and ll_long[0][0] < 0.0
+
+    # End-to-end CLI main() smoke across tokenizer, midtrain, dpo, grpo, and eval_runner
+    from crouton.eval import eval_runner as eval_mod
+    from crouton.tokenizer import train_tokenizer as tok_mod
+    from crouton.train import dpo as dpo_mod
+    from crouton.train import grpo as grpo_mod
+    from crouton.train import midtrain as mid_mod
+
+    cli_tok = tmp_path / "cli_tok.json"
+    monkeypatch.setattr(sys, "argv", ["crouton-tokenizer", "--local-file", str(data_file), "--output", str(cli_tok), "--vocab-size", "260"])
+    tok_mod.main()
+    assert cli_tok.exists()
+
+    mid_out = tmp_path / "cli_mid"
+    monkeypatch.setattr(sys, "argv", ["crouton-mid", "--base-checkpoint", ckpt_file, "--tokenizer", str(tok_path), "--output-dir", str(mid_out), "--local-file", str(data_file), "--seq-len", "16", "--steps", "1", "--micro-batch", "1", "--grad-accum", "1", "--no-bf16"])
+    mid_mod.main()
+    assert (mid_out / "final.pt").exists()
+
+    grpo_out = tmp_path / "cli_grpo"
+    monkeypatch.setattr(sys, "argv", ["crouton-grpo", "--base-checkpoint", str(mid_out / "final.pt"), "--tokenizer", str(tok_path), "--output-dir", str(grpo_out), "--builtin-math", "--steps", "1", "--group-size", "2", "--max-new-tokens", "4", "--no-bf16"])
+    grpo_mod.main()
+    assert (grpo_out / "final.pt").exists()
+
+    eval_json = tmp_path / "eval.json"
+    monkeypatch.setattr(sys, "argv", ["crouton-eval", "--checkpoint", str(grpo_out / "final.pt"), "--compare-checkpoint", ckpt_file, "--tokenizer", str(tok_path), "--val-file", str(data_file), "--batch-size", "2", "--no-bf16", "--output-json", str(eval_json)])
+    eval_mod.main()
+    assert eval_json.exists()
+
+    monkeypatch.setattr(sys, "argv", ["crouton-eval", "--checkpoint", ckpt_file, "--tasks", ",,,"])
+    with pytest.raises(SystemExit):
+        eval_mod.main()
+    monkeypatch.setattr(sys, "argv", ["crouton-dpo", "--base-checkpoint", ckpt_file, "--beta", "0"])
+    with pytest.raises(ValueError, match="beta"):
+        dpo_mod.main()
+    monkeypatch.setattr(sys, "argv", ["crouton-grpo", "--base-checkpoint", ckpt_file, "--temperature", "0"])
+    with pytest.raises(SystemExit):
+        grpo_mod.main()

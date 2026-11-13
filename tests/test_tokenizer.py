@@ -5,6 +5,7 @@ import torch
 from tokenisers import WpBpePpigTokenizer, _core
 
 from crouton.data import PreferenceDataset, StreamingPackedDataset, format_chatml_sft_with_mask
+from crouton.data.pretrain_data import resolve_token_id
 from crouton.tokenizer import build_crouton_pretokenizer
 from crouton.tokenizer.train_tokenizer import read_local_corpus, train_crouton_tokenizer
 
@@ -115,3 +116,19 @@ def test_train_wp_bpe_ppig_json_and_dir_and_sft_masking(tmp_path):
         _ = bad_pref[0]
     with pytest.raises(ValueError, match="non-empty"):
         StreamingPackedDataset(tokenizer=tok, seq_len=16, sources=[])
+
+    # resolve_token_id returns fallback (not byte id '<') for absent special tokens
+    assert resolve_token_id(tok, "<|absent_special|>", fallback=7) == 7
+
+    # StreamingPackedDataset splits literal special token strings inside raw pretraining documents
+    im_end_id = tok.token_to_id("<|im_end|>")
+    raw_ds = StreamingPackedDataset(tokenizer=tok, seq_len=32, local_texts=["literal <|im_end|> text " * 6])
+    first_x, _ = next(iter(raw_ds))
+    assert im_end_id is not None and int(im_end_id) not in first_x.tolist()
+
+    # Tokenizer training parameter validation
+    for kw in ({"vocab_size": 0}, {"min_frequency": 0}, {"length_penalty": -0.1}):
+        with pytest.raises(ValueError):
+            train_crouton_tokenizer(corpus, output_path=tmp_path / "bad.json", **kw)
+    with pytest.raises(ValueError, match="non-empty"):
+        train_crouton_tokenizer([], output_path=tmp_path / "empty.json", vocab_size=260)

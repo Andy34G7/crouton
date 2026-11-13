@@ -38,8 +38,15 @@ class CroutonConfig:
     use_flex_attention: bool = True
 
     def __post_init__(self) -> None:
-        if self.vocab_size < 1:
-            raise ValueError(f"vocab_size ({self.vocab_size}) must be >= 1")
+        if (
+            self.vocab_size < 1
+            or self.d_model < 1
+            or self.n_layers < 1
+            or self.n_heads < 1
+            or self.n_kv_heads < 1
+            or self.d_ff < 1
+        ):
+            raise ValueError("vocab_size, d_model, n_layers, n_heads, n_kv_heads, and d_ff must all be >= 1")
         if self.d_model % self.n_heads != 0:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         if self.n_heads % self.n_kv_heads != 0:
@@ -50,12 +57,14 @@ class CroutonConfig:
             raise ValueError("global_layer_interval must be >= 1")
         if self.sliding_window < 1 or self.sink_tokens < 0:
             raise ValueError("sliding_window must be >= 1 and sink_tokens >= 0")
-        if self.expert_rank < 1 or self.n_experts < 1:
-            raise ValueError("expert_rank and n_experts must be >= 1")
+        if self.expert_rank < 1 or self.n_experts < 1 or self.expert_alpha <= 0.0:
+            raise ValueError("expert_rank and n_experts must be >= 1 and expert_alpha must be > 0")
+        if self.norm_eps <= 0.0 or self.logit_softcap < 0.0 or self.router_jitter < 0.0:
+            raise ValueError("norm_eps must be > 0 and logit_softcap / router_jitter must be >= 0")
         if self.max_seq_len < 1:
             raise ValueError(f"max_seq_len ({self.max_seq_len}) must be >= 1")
-        if self.rope_scale_factor <= 0.0 or self.rope_original_max_seq_len < 1:
-            raise ValueError("rope_scale_factor must be > 0 and rope_original_max_seq_len >= 1")
+        if self.rope_theta <= 1.0 or self.rope_scale_factor <= 0.0 or self.rope_original_max_seq_len < 1:
+            raise ValueError("rope_theta must be > 1, rope_scale_factor > 0, and rope_original_max_seq_len >= 1")
         if self.rope_scaling_type not in ("yarn", "ntk"):
             raise ValueError(f"Unsupported rope_scaling_type: {self.rope_scaling_type!r}")
 
@@ -77,8 +86,13 @@ class CroutonConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> CroutonConfig:
-        data = yaml.safe_load(Path(path).read_text())
-        return cls(**data)
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected YAML mapping in {path}, got {type(data).__name__}")
+        try:
+            return cls(**data)
+        except TypeError as exc:
+            raise ValueError(f"Invalid CroutonConfig fields in {path}: {exc}") from exc
 
 
 @dataclass
@@ -104,3 +118,21 @@ class TrainConfig:
     eval_interval: int = 500
     save_interval: int = 1000
     seed: int = 42
+
+    def __post_init__(self) -> None:
+        if (
+            self.seq_len < 1
+            or self.micro_batch_size < 1
+            or self.grad_accum_steps < 1
+            or self.total_steps < 1
+            or self.log_interval < 1
+        ):
+            raise ValueError(
+                "seq_len, micro_batch_size, grad_accum_steps, total_steps, and log_interval must all be >= 1"
+            )
+        if self.warmup_steps < 0 or self.decay_steps < 0 or self.eval_interval < 0 or self.save_interval < 0:
+            raise ValueError("warmup_steps, decay_steps, eval_interval, and save_interval must be >= 0")
+        if self.muon_lr <= 0.0 or self.adamw_lr <= 0.0 or not (0.0 <= self.min_lr_ratio <= 1.0):
+            raise ValueError("muon_lr and adamw_lr must be > 0 and min_lr_ratio must be in [0, 1]")
+        if self.weight_decay < 0.0 or self.grad_clip <= 0.0:
+            raise ValueError("weight_decay must be >= 0 and grad_clip must be > 0")

@@ -13,7 +13,7 @@ def resolve_token_id(tokenizer, token: str, fallback: int = 0) -> int:
     if tid is not None:
         return int(tid)
     encoded = tokenizer.encode(token)
-    return int(encoded[0]) if encoded else fallback
+    return int(encoded[0]) if len(encoded) == 1 else fallback
 
 
 class StreamingPackedDataset(IterableDataset):
@@ -108,7 +108,7 @@ class StreamingPackedDataset(IterableDataset):
         buf: list[int] = []
         chunk_size = self.seq_len + 1
         for text in self._iter_texts():
-            ids = self.tokenizer.encode(text)
+            ids = self.tokenizer.encode(text, split_special_tokens=True)
             buf.extend(ids)
             buf.append(self.eos_id)
             while len(buf) >= chunk_size:

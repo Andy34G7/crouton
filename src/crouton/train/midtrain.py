@@ -40,13 +40,26 @@ def run_midtrain(
     split: str = "train",
     text_field: str = "text",
     local_file: str | None = None,
+    bf16: bool = True,
+    save_interval: int = 0,
     seed: int = 42,
 ) -> None:
     if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1:
         raise ValueError("seq_len, total_steps, micro_batch_size, and grad_accum_steps must all be >= 1")
+    if warmup_steps < 0 or save_interval < 0 or muon_lr <= 0.0 or adamw_lr <= 0.0 or rope_scale_factor <= 0.0:
+        raise ValueError("warmup_steps and save_interval must be >= 0; muon_lr, adamw_lr, and rope_scale_factor must be > 0")
+    if subset is not None and not dataset_name:
+        raise ValueError("subset requires dataset_name to be set")
+
+    local_texts = None
+    if local_file is not None:
+        local_texts = [line.strip() for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not local_texts:
+            raise ValueError(f"Local mid-training file {local_file!r} contains no non-empty lines")
+
     torch.manual_seed(seed)
     device = get_device()
-    use_bf16 = bf16_supported(device)
+    use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     model, model_cfg, _ = load_checkpoint(
@@ -58,10 +71,6 @@ def run_midtrain(
     )
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
-
-    local_texts = None
-    if local_file is not None:
-        local_texts = [line.strip() for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
 
     sources = (
         [(dataset_name, subset, split, text_field)]
@@ -113,6 +122,8 @@ def run_midtrain(
 
         if step % 10 == 0:
             print(f"[midtrain step {step:5d}] ctx={seq_len} loss={total_loss:.4f} lr_mult={mult:.3f}")
+        if save_interval > 0 and step > 0 and step % save_interval == 0:
+            save_checkpoint(Path(output_dir) / f"step_{step}.pt", model, model_cfg, step)
 
     save_checkpoint(Path(output_dir) / "final.pt", model, model_cfg, total_steps)
 
@@ -136,6 +147,8 @@ def main() -> None:
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--local-file", type=str, default=None)
+    parser.add_argument("--save-interval", type=int, default=0)
+    parser.add_argument("--no-bf16", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -158,6 +171,8 @@ def main() -> None:
         split=args.split,
         text_field=args.text_field,
         local_file=args.local_file,
+        bf16=not args.no_bf16,
+        save_interval=args.save_interval,
         seed=args.seed,
     )
 

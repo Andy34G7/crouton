@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -44,21 +43,26 @@ def run_pretrain(
     local_file: str | None = None,
     val_file: str | None = None,
 ) -> None:
-    if train_cfg.seq_len < 1 or train_cfg.total_steps < 1 or train_cfg.micro_batch_size < 1 or train_cfg.grad_accum_steps < 1:
-        raise ValueError("seq_len, total_steps, micro_batch_size, and grad_accum_steps must all be >= 1")
+    model_cfg.__post_init__()
+    train_cfg.__post_init__()
     torch.manual_seed(train_cfg.seed)
     device = get_device()
     use_bf16 = train_cfg.bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    tokenizer = WpBpePpigTokenizer.from_pretrained(train_cfg.tokenizer_path)
-    validate_tokenizer_vocab(tokenizer, model_cfg)
     local_texts = None
     if local_file is not None:
         local_texts = [line.strip() for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not local_texts:
+            raise ValueError(f"Local training file {local_file!r} contains no non-empty lines")
     val_texts = None
     if val_file is not None:
         val_texts = [line.strip() for line in Path(val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not val_texts:
+            raise ValueError(f"Validation file {val_file!r} contains no non-empty lines")
+
+    tokenizer = WpBpePpigTokenizer.from_pretrained(train_cfg.tokenizer_path)
+    validate_tokenizer_vocab(tokenizer, model_cfg)
 
     dataset = StreamingPackedDataset(
         tokenizer=tokenizer,

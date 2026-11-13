@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -60,7 +61,7 @@ def build_padded_attn_mask(
     sliding_window: int,
     sink_tokens: int,
 ) -> torch.Tensor:
-    """Build [B, 1, T, T] boolean causal/SWA mask honoring key padding without NaN rows."""
+    """Build [B, 1, T, T] boolean causal/SWA mask for right-padded inputs without NaN rows."""
     key_keep = attention_mask[:, None, None, :].bool()
     if is_global:
         base_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=attention_mask.device))
@@ -69,6 +70,17 @@ def build_padded_attn_mask(
         base_mask = build_swa_sink_mask(seq_len, sliding_window, sink_tokens, attention_mask.device)
     eye = torch.eye(seq_len, dtype=torch.bool, device=attention_mask.device).unsqueeze(0).unsqueeze(0)
     return (base_mask & key_keep) | eye
+
+
+@lru_cache(maxsize=16)
+def _get_swa_mask_mod(window_size: int, sink_tokens: int):
+    def swa_sink_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+        causal = q_idx >= kv_idx
+        in_window = (q_idx - kv_idx) < window_size
+        is_sink = kv_idx < sink_tokens
+        return causal & (in_window | is_sink)
+
+    return swa_sink_mask
 
 
 @torch.compiler.disable
@@ -85,14 +97,8 @@ def _get_cached_swa_block_mask(
         _BLOCK_MASK_CACHE.move_to_end(key)
         return cached
 
-    def swa_sink_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
-        causal = q_idx >= kv_idx
-        in_window = (q_idx - kv_idx) < window_size
-        is_sink = kv_idx < sink_tokens
-        return causal & (in_window | is_sink)
-
     block_mask = create_block_mask(
-        swa_sink_mask,
+        _get_swa_mask_mod(window_size, sink_tokens),
         B=None,
         H=None,
         Q_LEN=seq_len,

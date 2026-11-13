@@ -85,14 +85,18 @@ def run_preference_tuning(
     beta: float = 0.1,
     use_orpo: bool = False,
     max_examples: int = 20000,
+    bf16: bool = True,
+    save_interval: int = 0,
     seed: int = 42,
     pairs_override: list[dict[str, Any]] | None = None,
 ) -> None:
     if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1 or max_examples < 1:
         raise ValueError("seq_len, total_steps, micro_batch_size, grad_accum_steps, and max_examples must be >= 1")
+    if lr <= 0.0 or beta <= 0.0 or save_interval < 0:
+        raise ValueError("lr and beta must be > 0 and save_interval must be >= 0")
     torch.manual_seed(seed)
     device = get_device()
-    use_bf16 = bf16_supported(device)
+    use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     policy, model_cfg, _ = load_checkpoint(base_checkpoint, device=device, override_seq_len=seq_len)
@@ -153,23 +157,25 @@ def run_preference_tuning(
             r_ids = batch["rejected_ids"].to(device)
             r_lbl = batch["rejected_labels"].to(device)
             r_mask = batch["rejected_mask"].to(device)
+            valid_pair = ((c_lbl != -100).sum(dim=-1) > 0) & ((r_lbl != -100).sum(dim=-1) > 0)
+            if not valid_pair.any():
+                continue
+            if not valid_pair.all():
+                c_ids, c_lbl, c_mask = c_ids[valid_pair], c_lbl[valid_pair], c_mask[valid_pair]
+                r_ids, r_lbl, r_mask = r_ids[valid_pair], r_lbl[valid_pair], r_mask[valid_pair]
             n_pairs = int(c_ids.size(0))
 
             with amp_ctx:
-                c_out = policy(c_ids, targets=c_lbl if use_orpo else None, attention_mask=c_mask)
+                c_out = policy(c_ids, attention_mask=c_mask)
                 r_out = policy(r_ids, attention_mask=r_mask)
                 p_c = sequence_logps(c_out.logits, c_lbl)
                 p_r = sequence_logps(r_out.logits, r_lbl)
 
                 if use_orpo:
-                    loss = orpo_loss(
-                        p_c,
-                        p_r,
-                        c_out.loss,
-                        (c_lbl != -100).sum(dim=-1),
-                        (r_lbl != -100).sum(dim=-1),
-                        beta=beta,
-                    )
+                    c_len = (c_lbl != -100).sum(dim=-1)
+                    r_len = (r_lbl != -100).sum(dim=-1)
+                    chosen_sft_loss = (-p_c / c_len.clamp(min=1)).mean()
+                    loss = orpo_loss(p_c, p_r, chosen_sft_loss, c_len, r_len, beta=beta)
                 else:
                     with torch.no_grad():
                         ref_c = sequence_logps(ref_model(c_ids, attention_mask=c_mask).logits, c_lbl)
@@ -194,6 +200,8 @@ def run_preference_tuning(
         if step % 10 == 0:
             mode = "orpo" if use_orpo else "dpo"
             print(f"[{mode} step {step:5d}] loss={total_loss:.4f} lr_mult={mult:.3f}")
+        if save_interval > 0 and step > 0 and step % save_interval == 0:
+            save_checkpoint(Path(output_dir) / f"step_{step}.pt", policy, model_cfg, step)
 
     save_checkpoint(Path(output_dir) / "final.pt", policy, model_cfg, total_steps)
 
@@ -213,6 +221,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--max-examples", type=int, default=20000)
+    parser.add_argument("--save-interval", type=int, default=0)
+    parser.add_argument("--no-bf16", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -231,6 +241,8 @@ def main() -> None:
         lr=args.lr,
         beta=args.beta,
         max_examples=args.max_examples,
+        bf16=not args.no_bf16,
+        save_interval=args.save_interval,
         seed=args.seed,
     )
 

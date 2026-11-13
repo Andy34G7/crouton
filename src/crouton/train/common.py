@@ -133,9 +133,12 @@ def evaluate_model_bpb(
 
             total_bytes += len(text.encode("utf-8"))
 
-        avg_nats = total_nll_nats / max(1, total_tokens)
+        if total_tokens == 0 or total_bytes == 0:
+            raise ValueError("Evaluation texts must contain at least one non-empty tokenizable document")
+
+        avg_nats = total_nll_nats / total_tokens
         ppl = math.exp(min(avg_nats, 20.0))
-        bpb = (total_nll_nats / math.log(2.0)) / max(1, total_bytes)
+        bpb = (total_nll_nats / math.log(2.0)) / total_bytes
         return {"loss_nats": avg_nats, "ppl": ppl, "bpb": bpb, "tokens": float(total_tokens)}
     finally:
         if was_training:

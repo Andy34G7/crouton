@@ -20,6 +20,8 @@ def iter_hf_corpus(
     sources: list[tuple[str, str | None, str, str]],
     max_docs: int,
 ) -> list[str]:
+    if max_docs < 1:
+        raise ValueError(f"max_docs ({max_docs}) must be >= 1")
     from datasets import load_dataset
 
     iters = [iter(load_dataset(name, subset, split=split, streaming=True)) for name, subset, split, _ in sources]
@@ -59,8 +61,14 @@ def train_crouton_tokenizer(
     individual_digits: bool = True,
 ) -> WpBpePpigTokenizer:
     """Train WpBpePpigTokenizer with crouton pretokenizer and export to `output_path`."""
+    if vocab_size < 1 or min_frequency < 1 or length_penalty < 0.0:
+        raise ValueError("vocab_size must be >= 1, min_frequency >= 1, and length_penalty >= 0")
     if isinstance(corpus, str):
-        corpus = [line for line in corpus.splitlines() if line.strip()] or [corpus]
+        corpus = [line for line in corpus.splitlines() if line.strip()] or ([corpus] if corpus.strip() else [])
+    else:
+        corpus = [t for t in corpus if isinstance(t, str) and t.strip()]
+    if not corpus:
+        raise ValueError("Training corpus must contain at least one non-empty document")
 
     pretokenizer = build_crouton_pretokenizer(individual_digits=individual_digits)
     tok = WpBpePpigTokenizer.train(
@@ -95,9 +103,17 @@ def main() -> None:
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--max-docs", type=int, default=50000)
     args = parser.parse_args()
+    if args.vocab_size < 1 or args.min_frequency < 1 or args.length_penalty < 0.0 or args.max_docs < 1:
+        parser.error("--vocab-size, --min-frequency, and --max-docs must be >= 1, and --length-penalty >= 0")
+    if args.local_file and (args.dataset or args.subset is not None):
+        parser.error("--local-file cannot be combined with --dataset or --subset")
+    if args.subset is not None and not args.dataset:
+        parser.error("--subset requires --dataset")
 
     if args.local_file:
         corpus = read_local_corpus(args.local_file)
+        if not corpus or not any(line.strip() for line in corpus):
+            raise ValueError(f"Local tokenizer corpus {args.local_file!r} contains no non-empty text")
     elif args.dataset:
         subset = None if args.subset in (None, "none", "None", "") else args.subset
         corpus = iter_hf_corpus(
