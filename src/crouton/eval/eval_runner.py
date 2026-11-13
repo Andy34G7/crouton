@@ -159,7 +159,7 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
                 max_new_tokens=max_toks,
                 temperature=temp,
                 top_k=top_k,
-                eos_token_ids=[self.eot_id],
+                eos_token_ids=[self.eot_token_id],
             )
             text = self.tok_decode(seq[0, x.size(1) :].tolist())
             for stop in until:

@@ -49,11 +49,16 @@ def test_forward_backward_yarn_ntk_and_generate():
         out_long = model(x_long)
         assert out_long.logits.shape == (1, 48, 512)
 
-    # Test attention_mask padding and generate() with EOS stop
+    # Test attention_mask padding, all-(-100) NaN guard, and generate() with EOS stop
     prompt = torch.tensor([[1, 2, 3, 0, 0]], dtype=torch.long)
     mask = torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.bool)
     out_masked = model(prompt, attention_mask=mask)
     assert torch.isfinite(out_masked.logits).all()
+
+    all_ignored = torch.full_like(prompt, -100)
+    out_ignored = model(prompt, targets=all_ignored, attention_mask=mask)
+    assert torch.isfinite(out_ignored.loss) and float(out_ignored.loss.item()) == 0.0
+    out_ignored.loss.backward()
 
     gen = model.generate(prompt[:, :3], max_new_tokens=5, temperature=0.0, eos_token_ids=[999999])
     assert gen.shape == (1, 8)
