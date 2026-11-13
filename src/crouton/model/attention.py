@@ -16,10 +16,12 @@ try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
     HAS_FLEX_ATTENTION = True
+    _compiled_flex_attention = torch.compile(flex_attention)
 except ImportError:
     HAS_FLEX_ATTENTION = False
     create_block_mask = None
     flex_attention = None
+    _compiled_flex_attention = None
 
 _BLOCK_MASK_CACHE: OrderedDict[tuple[int, int, int, str, int | None], object] = OrderedDict()
 _MAX_MASK_CACHE = 16
@@ -97,14 +99,22 @@ class HybridSparseAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.norm_eps) if config.qk_norm else None
         self.k_norm = RMSNorm(self.head_dim, eps=config.norm_eps) if config.qk_norm else None
 
-    def _flex_swa_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        block_mask = _get_cached_swa_block_mask(
-            seq_len=q.shape[2],
-            window_size=self.sliding_window,
-            sink_tokens=self.sink_tokens,
-            device=q.device,
-        )
-        return flex_attention(q, k, v, block_mask=block_mask, enable_gqa=self.n_rep > 1)
+    def _flex_swa_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        block_mask: object | None = None,
+    ) -> torch.Tensor:
+        if block_mask is None:
+            block_mask = _get_cached_swa_block_mask(
+                seq_len=q.shape[2],
+                window_size=self.sliding_window,
+                sink_tokens=self.sink_tokens,
+                device=q.device,
+            )
+        attn_fn = flex_attention if torch.compiler.is_compiling() else _compiled_flex_attention
+        return attn_fn(q, k, v, block_mask=block_mask, enable_gqa=self.n_rep > 1)
 
     def forward(
         self,
@@ -112,6 +122,7 @@ class HybridSparseAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        swa_block_mask: object | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
 
@@ -143,7 +154,7 @@ class HybridSparseAttention(nn.Module):
         elif self.is_global:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.n_rep > 1)
         elif self.use_flex and q.is_cuda:
-            out = self._flex_swa_attention(q, k, v)
+            out = self._flex_swa_attention(q, k, v, block_mask=swa_block_mask)
         else:
             attn_mask = build_swa_sink_mask(seq_len, self.sliding_window, self.sink_tokens, q.device)
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=self.n_rep > 1)

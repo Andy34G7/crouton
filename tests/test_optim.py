@@ -13,6 +13,7 @@ from crouton.tokenizer.train_tokenizer import train_crouton_tokenizer
 from crouton.train.common import load_checkpoint, strip_orig_mod_prefix
 from crouton.train.dpo import dpo_loss, orpo_loss, run_preference_tuning
 from crouton.train.grpo import (
+    _gather_completion_logps,
     build_builtin_math_tasks,
     extract_numeric_answer,
     grpo_step_loss,
@@ -120,8 +121,8 @@ def test_streaming_dataset_terminates_on_exhaustion(tmp_path):
     corpus = ["Hello world."] * 5
     tok_path = tmp_path / "tok.json"
     tok = train_crouton_tokenizer(corpus, output_path=tok_path, vocab_size=300)
-    ds = StreamingPackedDataset(tokenizer=tok, seq_len=16, local_texts=[])
-    assert list(ds) == []
+    assert list(StreamingPackedDataset(tokenizer=tok, seq_len=16, local_texts=[])) == []
+    assert list(StreamingPackedDataset(tokenizer=tok, seq_len=16, local_texts=["   ", "\n\t"])) == []
 
     # Long prompt left-truncation keeps assistant targets
     long_user = "word " * 100
@@ -131,6 +132,13 @@ def test_streaming_dataset_terminates_on_exhaustion(tmp_path):
         seq_len=16,
     )
     assert (y != -100).any()
+
+
+def test_gather_completion_logps_clipped_prompt():
+    model = CroutonForCausalLM(_tiny_cfg())
+    seq = torch.randint(0, 300, (1, 14))
+    logps = _gather_completion_logps(model, seq=seq, prompt_len=6, max_seq_len=5)
+    assert logps.shape == (5,) and torch.isfinite(logps).all()
 
 
 def test_strip_orig_mod_checkpoint_roundtrip(tmp_path):

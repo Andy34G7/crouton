@@ -146,7 +146,7 @@ def _gather_completion_logps(
     else:
         start_logit = prompt_len - 1
     logits = model(inp).logits[:, start_logit:, :].float()
-    logits = logits[:, : tgt.size(1), :]
+    tgt = tgt[:, -logits.size(1) :]
     log_probs = F.log_softmax(logits, dim=-1)
     return torch.gather(log_probs, -1, tgt.unsqueeze(-1)).squeeze(-1).squeeze(0)
 

@@ -102,8 +102,8 @@ def apply_rope(
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary embeddings to q, k of shape [B, H, T, D]."""
-    cos_u = cos.unsqueeze(0).unsqueeze(0)
-    sin_u = sin.unsqueeze(0).unsqueeze(0)
+    cos_u = cos.to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
+    sin_u = sin.to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
     q_rot = (q * cos_u) + (rotate_half(q) * sin_u)
     k_rot = (k * cos_u) + (rotate_half(k) * sin_u)
     return q_rot, k_rot

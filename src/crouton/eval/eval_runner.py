@@ -126,12 +126,12 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
             ll_first, _ = self._score_pair(ids[:1], ids[1:first_end])
             total = ll_first
 
-            # Subsequent overlapping windows keep full context of length max_length - len(cont)
+            # Subsequent overlapping windows keep full context up to max_length + 1 total tokens.
             pos = first_end
             while pos < len(ids):
                 end = min(len(ids), pos + stride)
                 cont = ids[pos:end]
-                ctx_start = max(0, pos - max(1, self.max_length - len(cont)))
+                ctx_start = max(0, pos - max(1, self.max_length + 1 - len(cont)))
                 ctx = ids[ctx_start:pos]
                 ll_chunk, _ = self._score_pair(ctx, cont)
                 total += ll_chunk
@@ -161,7 +161,10 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
                 top_k=top_k,
                 eos_token_ids=[self.eot_token_id],
             )
-            text = self.tok_decode(seq[0, x.size(1) :].tolist())
+            gen_ids = seq[0, x.size(1) :].tolist()
+            if gen_ids and gen_ids[-1] == self.eot_token_id:
+                gen_ids = gen_ids[:-1]
+            text = self.tok_decode(gen_ids)
             for stop in until:
                 if stop and stop in text:
                     text = text.split(stop, 1)[0]

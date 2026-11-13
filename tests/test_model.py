@@ -4,6 +4,7 @@ import torch
 
 from crouton.config import CroutonConfig
 from crouton.model import CroutonForCausalLM, build_swa_sink_mask
+from crouton.model.rope import apply_rope
 
 
 def test_swa_sink_mask_properties():
@@ -62,6 +63,55 @@ def test_forward_backward_yarn_ntk_and_generate():
 
     gen = model.generate(prompt[:, :3], max_new_tokens=5, temperature=0.0, eos_token_ids=[999999])
     assert gen.shape == (1, 8)
+
+
+def test_bf16_autocast_forward_backward():
+    q = torch.randn(1, 4, 8, 16, dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 8, 16, dtype=torch.bfloat16)
+    cos = torch.ones(8, 16, dtype=torch.float32)
+    sin = torch.zeros(8, 16, dtype=torch.float32)
+    q_rot, k_rot = apply_rope(q, k, cos, sin)
+    assert q_rot.dtype == torch.bfloat16 and k_rot.dtype == torch.bfloat16
+
+    cfg = CroutonConfig(
+        vocab_size=256,
+        d_model=64,
+        n_layers=4,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=128,
+        n_experts=4,
+        expert_rank=8,
+        max_seq_len=32,
+        sliding_window=8,
+        sink_tokens=2,
+        global_layer_interval=2,
+        use_flex_attention=False,
+    )
+    model = CroutonForCausalLM(cfg)
+    x = torch.randint(0, 256, (2, 16))
+    y = torch.randint(0, 256, (2, 16))
+    attn_mask = torch.ones((2, 16), dtype=torch.bool)
+    attn_mask[1, -3:] = False
+
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        out = model(x, targets=y, attention_mask=attn_mask)
+    assert out.loss is not None and torch.isfinite(out.loss)
+    out.loss.backward()
+    for p in model.parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all()
+
+    model.zero_grad(set_to_none=True)
+    all_ignored = torch.full_like(y, -100)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        out_ignored = model(x, targets=all_ignored)
+    assert out_ignored.loss is not None and torch.isfinite(out_ignored.loss)
+    assert float(out_ignored.loss.item()) == 0.0
+    out_ignored.loss.backward()
+    for p in model.parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all()
 
 
 def test_yaml_configs_instantiate():

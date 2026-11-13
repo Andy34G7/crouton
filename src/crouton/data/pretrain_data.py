@@ -38,7 +38,11 @@ class StreamingPackedDataset(IterableDataset):
             ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
             ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
         ]
-        self.local_texts = local_texts
+        self.local_texts = (
+            [t for t in local_texts if isinstance(t, str) and t.strip()]
+            if local_texts is not None
+            else None
+        )
         self.eos_id = resolve_token_id(tokenizer, eos_token, fallback=0)
 
     def _iter_texts(self) -> Iterator[str]:
