@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -59,36 +60,47 @@ def run_preference_tuning(
     tokenizer_path: str,
     output_dir: str,
     dataset_name: str = "argilla/ultrafeedback-binarized-preferences-cleaned",
-    seq_len: int = 2048,
+    subset: str | None = None,
+    seq_len: int = 4096,
     total_steps: int = 1000,
     micro_batch_size: int = 1,
     grad_accum_steps: int = 16,
     lr: float = 5e-6,
     beta: float = 0.1,
     use_orpo: bool = False,
+    max_examples: int = 20000,
+    pairs_override: list[dict[str, Any]] | None = None,
 ) -> None:
     device = get_device()
     use_bf16 = device.type == "cuda"
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    policy, model_cfg, _ = load_checkpoint(base_checkpoint, device=device)
+    policy, model_cfg, _ = load_checkpoint(base_checkpoint, device=device, override_seq_len=seq_len)
     ref_model = None
     if not use_orpo:
-        ref_model, _, _ = load_checkpoint(base_checkpoint, device=device)
+        ref_model, _, _ = load_checkpoint(base_checkpoint, device=device, override_seq_len=seq_len)
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad = False
 
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
-    raw = load_dataset(dataset_name, split="train", streaming=True)
-    pairs = []
-    for i, row in enumerate(raw):
-        if i >= 20000:
-            break
-        if "prompt" in row and "chosen" in row and "rejected" in row:
-            chosen = row["chosen"][-1]["content"] if isinstance(row["chosen"], list) else str(row["chosen"])
-            rejected = row["rejected"][-1]["content"] if isinstance(row["rejected"], list) else str(row["rejected"])
-            pairs.append({"prompt": str(row["prompt"]), "chosen": chosen, "rejected": rejected})
+
+    if pairs_override is not None:
+        pairs = pairs_override
+    else:
+        raw = load_dataset(dataset_name, subset, split="train", streaming=True)
+        pairs = []
+        for i, row in enumerate(raw):
+            if i >= max_examples:
+                break
+            if "prompt" in row and "chosen" in row and "rejected" in row:
+                pairs.append(
+                    {
+                        "prompt": row["prompt"],
+                        "chosen": row["chosen"],
+                        "rejected": row["rejected"],
+                    }
+                )
 
     ds = PreferenceDataset(pairs, tokenizer=tokenizer, seq_len=seq_len)
     loader = DataLoader(ds, batch_size=micro_batch_size, shuffle=True)
@@ -108,12 +120,14 @@ def run_preference_tuning(
                 batch = next(it)
             c_ids = batch["chosen_ids"].to(device)
             c_lbl = batch["chosen_labels"].to(device)
+            c_mask = batch["chosen_mask"].to(device)
             r_ids = batch["rejected_ids"].to(device)
             r_lbl = batch["rejected_labels"].to(device)
+            r_mask = batch["rejected_mask"].to(device)
 
             with amp_ctx:
-                c_out = policy(c_ids, targets=c_lbl)
-                r_out = policy(r_ids)
+                c_out = policy(c_ids, targets=c_lbl, attention_mask=c_mask)
+                r_out = policy(r_ids, attention_mask=r_mask)
                 p_c = sequence_logps(c_out.logits, c_lbl)
                 p_r = sequence_logps(r_out.logits, r_lbl)
 
@@ -128,8 +142,8 @@ def run_preference_tuning(
                     )
                 else:
                     with torch.no_grad():
-                        ref_c = sequence_logps(ref_model(c_ids).logits, c_lbl)
-                        ref_r = sequence_logps(ref_model(r_ids).logits, r_lbl)
+                        ref_c = sequence_logps(ref_model(c_ids, attention_mask=c_mask).logits, c_lbl)
+                        ref_r = sequence_logps(ref_model(r_ids, attention_mask=r_mask).logits, r_lbl)
                     loss = dpo_loss(p_c, p_r, ref_c, ref_r, beta=beta)
 
                 loss = loss / grad_accum_steps
@@ -152,16 +166,33 @@ def main() -> None:
     parser.add_argument("--base-checkpoint", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default="artifacts/tokenizer/wp_bpe_ppig_32k.json")
     parser.add_argument("--output-dir", type=str, default="checkpoints/dpo")
+    parser.add_argument("--dataset", type=str, default="argilla/ultrafeedback-binarized-preferences-cleaned")
+    parser.add_argument("--subset", type=str, default=None)
+    parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--orpo", action="store_true", help="Use reference-free ORPO instead of DPO")
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--micro-batch", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--max-examples", type=int, default=20000)
     args = parser.parse_args()
 
+    subset = None if args.subset in (None, "none", "None", "") else args.subset
     run_preference_tuning(
         base_checkpoint=args.base_checkpoint,
         tokenizer_path=args.tokenizer,
         output_dir=args.output_dir,
+        dataset_name=args.dataset,
+        subset=subset,
+        seq_len=args.seq_len,
         use_orpo=args.orpo,
         total_steps=args.steps,
+        micro_batch_size=args.micro_batch,
+        grad_accum_steps=args.grad_accum,
+        lr=args.lr,
+        beta=args.beta,
+        max_examples=args.max_examples,
     )
 
 

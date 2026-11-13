@@ -16,34 +16,48 @@ from crouton.data import SFTDataset
 from crouton.optim import set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import get_device, load_checkpoint, save_checkpoint
 
+SFT_PRESETS: dict[str, tuple[str, str | None]] = {
+    "smoltalk": ("HuggingFaceTB/smoltalk", "all"),
+    "tulu3": ("allenai/tulu-3-sft-mixture", None),
+}
+
 
 def run_sft(
     base_checkpoint: str,
     tokenizer_path: str,
     output_dir: str,
     dataset_name: str = "HuggingFaceTB/smoltalk",
-    subset: str = "all",
+    subset: str | None = "all",
     seq_len: int = 4096,
     total_steps: int = 2000,
     micro_batch_size: int = 2,
     grad_accum_steps: int = 16,
     lr: float = 2e-5,
+    max_examples: int = 50000,
+    examples_override: list[list[dict[str, str]]] | None = None,
 ) -> None:
     device = get_device()
     use_bf16 = device.type == "cuda"
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    model, model_cfg, _ = load_checkpoint(base_checkpoint, device=device)
+    model, model_cfg, _ = load_checkpoint(
+        base_checkpoint,
+        device=device,
+        override_seq_len=seq_len,
+    )
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
 
-    raw = load_dataset(dataset_name, subset, split="train", streaming=True)
-    examples = []
-    for i, row in enumerate(raw):
-        if i >= 50000:
-            break
-        msgs = row.get("messages")
-        if isinstance(msgs, list) and msgs:
-            examples.append(msgs)
+    if examples_override is not None:
+        examples = examples_override
+    else:
+        raw = load_dataset(dataset_name, subset, split="train", streaming=True)
+        examples = []
+        for i, row in enumerate(raw):
+            if i >= max_examples:
+                break
+            msgs = row.get("messages")
+            if isinstance(msgs, list) and msgs:
+                examples.append(msgs)
 
     ds = SFTDataset(examples, tokenizer=tokenizer, seq_len=seq_len)
     loader = DataLoader(ds, batch_size=micro_batch_size, shuffle=True)
@@ -53,20 +67,26 @@ def run_sft(
     model.train()
 
     for step in range(total_steps):
-        mult = wsd_lr_multiplier(step, total_steps, warmup_steps=100, decay_steps=total_steps - 100, min_lr_ratio=0.1)
+        mult = wsd_lr_multiplier(
+            step,
+            total_steps,
+            warmup_steps=min(100, max(1, total_steps // 10)),
+            decay_steps=max(1, total_steps - min(100, max(1, total_steps // 10))),
+            min_lr_ratio=0.1,
+        )
         set_optimizer_lr(opt, lr, mult)
         opt.zero_grad(set_to_none=True)
         total_loss = 0.0
 
         for _ in range(grad_accum_steps):
             try:
-                x, y = next(it)
+                x, y, attn_mask = next(it)
             except StopIteration:
                 it = iter(loader)
-                x, y = next(it)
-            x, y = x.to(device), y.to(device)
+                x, y, attn_mask = next(it)
+            x, y, attn_mask = x.to(device), y.to(device), attn_mask.to(device)
             with amp_ctx:
-                out = model(x, targets=y)
+                out = model(x, targets=y, attention_mask=attn_mask)
                 loss = out.loss / grad_accum_steps
             loss.backward()
             total_loss += float(loss.item())
@@ -85,18 +105,35 @@ def main() -> None:
     parser.add_argument("--base-checkpoint", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default="artifacts/tokenizer/wp_bpe_ppig_32k.json")
     parser.add_argument("--output-dir", type=str, default="checkpoints/sft")
+    parser.add_argument("--preset", type=str, default=None, choices=["smoltalk", "tulu3"])
     parser.add_argument("--dataset", type=str, default="HuggingFaceTB/smoltalk")
     parser.add_argument("--subset", type=str, default="all")
+    parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--micro-batch", type=int, default=2)
+    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--max-examples", type=int, default=50000)
     args = parser.parse_args()
+
+    if args.preset is not None:
+        dataset_name, subset = SFT_PRESETS[args.preset]
+    else:
+        dataset_name = args.dataset
+        subset = None if args.subset in (None, "none", "None", "") else args.subset
 
     run_sft(
         base_checkpoint=args.base_checkpoint,
         tokenizer_path=args.tokenizer,
         output_dir=args.output_dir,
-        dataset_name=args.dataset,
-        subset=args.subset,
+        dataset_name=dataset_name,
+        subset=subset,
+        seq_len=args.seq_len,
         total_steps=args.steps,
+        micro_batch_size=args.micro_batch,
+        grad_accum_steps=args.grad_accum,
+        lr=args.lr,
+        max_examples=args.max_examples,
     )
 
 

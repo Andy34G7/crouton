@@ -21,11 +21,16 @@ def run_midtrain(
     output_dir: str,
     seq_len: int = 4096,
     rope_scale_factor: float = 2.0,
+    rope_scaling_type: str = "yarn",
     total_steps: int = 2000,
+    warmup_steps: int = 0,
     micro_batch_size: int = 2,
     grad_accum_steps: int = 16,
     muon_lr: float = 1e-2,
     adamw_lr: float = 1.5e-4,
+    dataset_name: str | None = None,
+    subset: str | None = None,
+    local_file: str | None = None,
 ) -> None:
     device = get_device()
     use_bf16 = device.type == "cuda"
@@ -36,15 +41,27 @@ def run_midtrain(
         device=device,
         override_seq_len=seq_len,
         override_rope_scale=rope_scale_factor,
+        override_rope_scaling_type=rope_scaling_type,
     )
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+
+    local_texts = None
+    if local_file is not None:
+        local_texts = [line for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    sources = (
+        [(dataset_name, subset, "train", "text")]
+        if dataset_name
+        else [
+            ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
+            ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
+        ]
+    )
     dataset = StreamingPackedDataset(
         tokenizer=tokenizer,
         seq_len=seq_len,
-        sources=[
-            ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
-            ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
-        ],
+        sources=sources,
+        local_texts=local_texts,
     )
     loader = iter(DataLoader(dataset, batch_size=micro_batch_size))
 
@@ -52,12 +69,11 @@ def run_midtrain(
     model.train()
 
     for step in range(total_steps):
-        # Pure WSD decay phase from 1.0 -> 0.05
         mult = wsd_lr_multiplier(
             step=step,
             total_steps=total_steps,
-            warmup_steps=50,
-            decay_steps=total_steps - 50,
+            warmup_steps=warmup_steps,
+            decay_steps=max(1, total_steps - warmup_steps),
             min_lr_ratio=0.05,
         )
         set_optimizer_lr(muon_opt, muon_lr, mult)
@@ -92,16 +108,35 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default="checkpoints/midtrain")
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--rope-scale", type=float, default=2.0)
+    parser.add_argument("--rope-scaling", type=str, default="yarn", choices=["yarn", "ntk"])
     parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--micro-batch", type=int, default=2)
+    parser.add_argument("--grad-accum", type=int, default=16)
+    parser.add_argument("--muon-lr", type=float, default=1e-2)
+    parser.add_argument("--adamw-lr", type=float, default=1.5e-4)
+    parser.add_argument("--dataset", type=str, default=None)
+    parser.add_argument("--subset", type=str, default=None)
+    parser.add_argument("--local-file", type=str, default=None)
     args = parser.parse_args()
 
+    subset = None if args.subset in (None, "none", "None", "") else args.subset
     run_midtrain(
         base_checkpoint=args.base_checkpoint,
         tokenizer_path=args.tokenizer,
         output_dir=args.output_dir,
         seq_len=args.seq_len,
         rope_scale_factor=args.rope_scale,
+        rope_scaling_type=args.rope_scaling,
         total_steps=args.steps,
+        warmup_steps=args.warmup_steps,
+        micro_batch_size=args.micro_batch,
+        grad_accum_steps=args.grad_accum,
+        muon_lr=args.muon_lr,
+        adamw_lr=args.adamw_lr,
+        dataset_name=args.dataset,
+        subset=subset,
+        local_file=args.local_file,
     )
 
 
