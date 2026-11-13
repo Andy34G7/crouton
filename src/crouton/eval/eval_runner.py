@@ -97,22 +97,46 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         results: list[tuple[float, bool]] = []
         for req in requests:
             ctx, cont = req.args
-            ctx_ids = self.tok_encode(ctx) if ctx else [self.eot_token_id]
-            cont_ids = self.tok_encode(cont)
+            if not ctx:
+                ctx_ids = [self.eot_token_id]
+                cont_ids = self.tok_encode(cont)
+            else:
+                ctx_ids = self.tok_encode(ctx)
+                full_ids = self.tok_encode(ctx + cont)
+                # Preserve BPE boundary merges across ctx/cont when prefixes align
+                if len(full_ids) > len(ctx_ids) and full_ids[: len(ctx_ids)] == ctx_ids:
+                    cont_ids = full_ids[len(ctx_ids) :]
+                else:
+                    cont_ids = self.tok_encode(cont)
             results.append(self._score_pair(ctx_ids, cont_ids))
         return results
 
     def loglikelihood_rolling(self, requests) -> list[float]:
         results: list[float] = []
+        stride = max(1, self.max_length // 2)
         for req in requests:
             (text,) = req.args
             ids = [self.eot_token_id] + self.tok_encode(text)
-            total = 0.0
-            for start in range(0, max(1, len(ids) - 1), self.max_length):
-                ctx = ids[max(0, start) : start + 1]
-                cont = ids[start + 1 : start + 1 + self.max_length]
-                ll, _ = self._score_pair(ctx, cont)
-                total += ll
+            if len(ids) < 2:
+                results.append(0.0)
+                continue
+
+            # Initial window predicts tokens [1 .. min(len(ids), max_length + 1))
+            first_end = min(len(ids), self.max_length + 1)
+            ll_first, _ = self._score_pair(ids[:1], ids[1:first_end])
+            total = ll_first
+
+            # Subsequent overlapping windows keep full context of length max_length - len(cont)
+            pos = first_end
+            while pos < len(ids):
+                end = min(len(ids), pos + stride)
+                cont = ids[pos:end]
+                ctx_start = max(0, pos - max(1, self.max_length - len(cont)))
+                ctx = ids[ctx_start:pos]
+                ll_chunk, _ = self._score_pair(ctx, cont)
+                total += ll_chunk
+                pos = end
+
             results.append(total)
         return results
 
@@ -120,23 +144,26 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         outputs: list[str] = []
         for req in requests:
             ctx, gen_kwargs = req.args
-            until = gen_kwargs.get("until", []) if isinstance(gen_kwargs, dict) else []
-            max_toks = gen_kwargs.get("max_gen_toks", self.max_gen_toks) if isinstance(gen_kwargs, dict) else self.max_gen_toks
-            temp = gen_kwargs.get("temperature", 0.0) if isinstance(gen_kwargs, dict) else 0.0
+            kwargs = gen_kwargs if isinstance(gen_kwargs, dict) else {}
+            raw_until = kwargs.get("until", [])
+            until = [raw_until] if isinstance(raw_until, str) else list(raw_until)
+            max_toks = int(kwargs.get("max_gen_toks", self.max_gen_toks))
+            do_sample = bool(kwargs.get("do_sample", False))
+            temp = float(kwargs.get("temperature", 0.0)) if do_sample else 0.0
+            top_k = int(kwargs.get("top_k", 0))
 
-            ctx_ids = self.tok_encode(ctx)
-            if not ctx_ids:
-                ctx_ids = [self.eot_token_id]
+            ctx_ids = self.tok_encode(ctx) or [self.eot_token_id]
             x = torch.tensor([ctx_ids[-self.max_length :]], dtype=torch.long, device=self.device)
             seq = self.model.generate(
                 x,
-                max_new_tokens=int(max_toks),
-                temperature=float(temp),
-                eos_token_ids=[self.eot_token_id],
+                max_new_tokens=max_toks,
+                temperature=temp,
+                top_k=top_k,
+                eos_token_ids=[self.eot_id],
             )
             text = self.tok_decode(seq[0, x.size(1) :].tolist())
             for stop in until:
-                if stop in text:
+                if stop and stop in text:
                     text = text.split(stop, 1)[0]
             outputs.append(text)
         return outputs
@@ -152,33 +179,50 @@ def evaluate_bpb(
     """
     Compute tokenizer-agnostic Bits-Per-Byte (BPB) and Perplexity (PPL)
     for fair comparison across tokenizers (e.g., crouton vs shortcake).
+    Prepends EOS so every token in each document is scored.
     """
     device = get_device()
     model, _, _ = load_checkpoint(checkpoint_path, device=device)
     model.eval()
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+    eos_id = resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
     use_bf16 = device.type == "cuda"
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     total_nll_nats = 0.0
     total_tokens = 0
     total_bytes = 0
+    stride = max(1, seq_len // 2)
 
     for text in texts:
-        ids = tokenizer.encode(text)
-        if len(ids) < 2:
+        doc_ids = tokenizer.encode(text)
+        if not doc_ids:
             continue
-        for start in range(0, len(ids) - 1, seq_len):
-            chunk = ids[start : start + seq_len + 1]
-            if len(chunk) < 2:
-                continue
-            x = torch.tensor([chunk[:-1]], dtype=torch.long, device=device)
-            y = torch.tensor([chunk[1:]], dtype=torch.long, device=device)
+        ids = [eos_id] + doc_ids
+        first_end = min(len(ids), seq_len + 1)
+        x = torch.tensor([ids[: first_end - 1]], dtype=torch.long, device=device)
+        y = torch.tensor([ids[1:first_end]], dtype=torch.long, device=device)
+        with amp_ctx:
+            out = model(x, targets=y)
+        n_tok = y.numel()
+        total_nll_nats += float(out.loss.item()) * n_tok
+        total_tokens += n_tok
+
+        pos = first_end
+        while pos < len(ids):
+            end = min(len(ids), pos + stride)
+            cont_len = end - pos
+            win_start = max(0, end - (seq_len + 1))
+            win = ids[win_start:end]
+            x = torch.tensor([win[:-1]], dtype=torch.long, device=device)
+            y = torch.tensor([win[1:]], dtype=torch.long, device=device)
             with amp_ctx:
-                out = model(x, targets=y)
-            n_tok = y.numel()
-            total_nll_nats += float(out.loss.item()) * n_tok
-            total_tokens += n_tok
+                logits = model(x).logits[0, -cont_len:].float()
+            loss = F.cross_entropy(logits, y[0, -cont_len:], reduction="sum")
+            total_nll_nats += float(loss.item())
+            total_tokens += cont_len
+            pos = end
+
         total_bytes += len(text.encode("utf-8"))
 
     avg_nats = total_nll_nats / max(1, total_tokens)
@@ -203,7 +247,7 @@ def evaluate_lm_eval(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate crouton checkpoint (BPB/PPL and/or lm-eval-harness).")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--compare-checkpoint", type=str, default=None, help="Optional baseline checkpoint to compare")
+    parser.add_argument("--compare-checkpoint", type=str, default=None, help="Optional crouton baseline checkpoint")
     parser.add_argument("--tokenizer", type=str, default="artifacts/tokenizer/wp_bpe_ppig_32k.json")
     parser.add_argument("--val-file", type=str, default=None, help="UTF-8 validation text file for BPB/PPL")
     parser.add_argument("--tasks", type=str, default=None, help="Comma-separated lm-eval-harness tasks")

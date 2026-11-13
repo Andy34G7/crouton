@@ -1,6 +1,6 @@
 # crouton
 
-A scalable PyTorch language model family (from ~14M prototypes up to ~300M parameters) implementing **Merged-LoRA Dense MoE (Mixture of Experts) with ReLU^2** and **Hybrid Sparse Attention**, trained with a **`wp-bpe-ppig`** tokenizer and evaluated with tokenizer-agnostic Bits-Per-Byte (BPB) and `lm-eval-harness` (enabling comparison against external baselines such as `shortcake` via `--compare-checkpoint` or standalone BPB metrics).
+A scalable PyTorch language model family (from ~14M prototypes up to ~300M parameters) implementing **Merged-LoRA Dense MoE (Mixture of Experts) with ReLU^2** and **Hybrid Sparse Attention**, trained with a **`wp-bpe-ppig`** tokenizer and evaluated with tokenizer-agnostic Bits-Per-Byte (BPB) and `lm-eval-harness` (enabling comparison against another `crouton` checkpoint via `--compare-checkpoint`, or against external baselines such as `shortcake` via BPB and benchmark task scores).
 
 ## Setup & Installation
 
@@ -72,7 +72,7 @@ python -m crouton.train.midtrain \
   --seq-len 4096 --rope-scale 2.0 --rope-scaling yarn
 ```
 
-4. **Stage 2 — Chat / Instruct SFT (Supervised Fine-Tuning)** (`AdamW` with ChatML assistant-only loss masking and `attention_mask` padding on `--preset smoltalk` (`HuggingFaceTB/smoltalk`) or `--preset tulu3` (`allenai/tulu-3-sft-mixture`)):
+4. **Stage 2 — Chat / Instruct SFT (Supervised Fine-Tuning)** (`AdamW` with token-weighted gradient accumulation, ChatML assistant-only loss masking, left-truncation preserving assistant turns, and `attention_mask` padding on `--preset smoltalk` (`HuggingFaceTB/smoltalk`) or `--preset tulu3` (`allenai/tulu-3-sft-mixture`)):
 
 ```bash
 python -m crouton.train.sft \
@@ -92,7 +92,7 @@ python -m crouton.train.dpo \
   --seq-len 4096
 ```
 
-6. **Stage 3b — Reasoning RL via GRPO (Group Relative Policy Optimization, Optional)** (runs on `openai/gsm8k` with exact numeric `#### <answer>` reward verification, or `--builtin-math` for offline arithmetic tasks):
+6. **Stage 3b — Reasoning RL via GRPO (Group Relative Policy Optimization, Optional)** (per-token clipped policy ratios and Schulman k3 KL estimator on `openai/gsm8k` with exact numeric `#### <answer>` reward verification, or `--builtin-math` for offline arithmetic tasks):
 
 ```bash
 python -m crouton.train.grpo \
@@ -101,7 +101,7 @@ python -m crouton.train.grpo \
   --output-dir checkpoints/grpo
 ```
 
-7. **Evaluation** (validation loss, Perplexity (PPL), and Bits-Per-Byte (BPB) via `--val-file`, and/or `lm-eval-harness` benchmarks via `--tasks`; pass `--compare-checkpoint` for side-by-side comparison):
+7. **Evaluation** (validation loss, Perplexity (PPL), and Bits-Per-Byte (BPB) via `--val-file`, and/or `lm-eval-harness` benchmarks via `--tasks`; pass `--compare-checkpoint` for side-by-side comparison against another `crouton` checkpoint):
 
 ```bash
 python -m crouton.eval.eval_runner \

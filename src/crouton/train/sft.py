@@ -1,4 +1,4 @@
-"""Stage 2 Post-Training: Chat/Instruct SFT with assistant-only loss masking."""
+"""Stage 2 Post-Training: Chat/Instruct SFT with token-weighted assistant loss masking."""
 
 from __future__ import annotations
 
@@ -76,7 +76,8 @@ def run_sft(
         )
         set_optimizer_lr(opt, lr, mult)
         opt.zero_grad(set_to_none=True)
-        total_loss = 0.0
+        total_nll = 0.0
+        total_valid_tokens = 0
 
         for _ in range(grad_accum_steps):
             try:
@@ -85,17 +86,24 @@ def run_sft(
                 it = iter(loader)
                 x, y, attn_mask = next(it)
             x, y, attn_mask = x.to(device), y.to(device), attn_mask.to(device)
+            n_valid = int((y != -100).sum().item())
             with amp_ctx:
                 out = model(x, targets=y, attention_mask=attn_mask)
-                loss = out.loss / grad_accum_steps
-            loss.backward()
-            total_loss += float(loss.item())
+                sum_loss = out.loss * float(n_valid)
+            sum_loss.backward()
+            total_nll += float(sum_loss.item())
+            total_valid_tokens += n_valid
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        if total_valid_tokens > 0:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.div_(float(total_valid_tokens))
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
 
+        avg_loss = total_nll / max(1, total_valid_tokens)
         if step % 10 == 0:
-            print(f"[sft step {step:5d}] loss={total_loss:.4f} lr_mult={mult:.3f}")
+            print(f"[sft step {step:5d}] loss={avg_loss:.4f} valid_toks={total_valid_tokens} lr_mult={mult:.3f}")
 
     save_checkpoint(Path(output_dir) / "final.pt", model, model_cfg, total_steps)
 

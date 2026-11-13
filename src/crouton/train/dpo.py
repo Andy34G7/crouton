@@ -15,6 +15,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from crouton.data import PreferenceDataset
+from crouton.optim import set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import get_device, load_checkpoint, save_checkpoint
 
 
@@ -25,6 +26,16 @@ def sequence_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     safe_labels = labels.clamp(min=0)
     token_logps = torch.gather(log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
     return (token_logps * mask).sum(dim=-1)
+
+
+def _log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """Numerically stable log(1 - exp(x)) for x <= 0."""
+    x = x.clamp(max=-1e-7)
+    return torch.where(
+        x > -0.6931471805599453,
+        torch.log(-torch.expm1(x)),
+        torch.log1p(-torch.exp(x)),
+    )
 
 
 def dpo_loss(
@@ -46,12 +57,10 @@ def orpo_loss(
     rejected_lengths: torch.Tensor,
     beta: float = 0.1,
 ) -> torch.Tensor:
-    """Reference-free Odds Ratio Preference Optimization (saves VRAM on single GPU)."""
+    """Reference-free Odds Ratio Preference Optimization with stable log1mexp."""
     c_avg = policy_chosen_logps / chosen_lengths.clamp(min=1)
     r_avg = policy_rejected_logps / rejected_lengths.clamp(min=1)
-    log_odds = (c_avg - r_avg) - torch.log1p(-c_avg.exp().clamp(max=0.9999)) + torch.log1p(
-        -r_avg.exp().clamp(max=0.9999)
-    )
+    log_odds = (c_avg - r_avg) - _log1mexp(c_avg) + _log1mexp(r_avg)
     return chosen_sft_loss - beta * F.logsigmoid(log_odds).mean()
 
 
@@ -110,6 +119,14 @@ def run_preference_tuning(
     policy.train()
 
     for step in range(total_steps):
+        mult = wsd_lr_multiplier(
+            step,
+            total_steps,
+            warmup_steps=min(50, max(1, total_steps // 10)),
+            decay_steps=max(1, total_steps - min(50, max(1, total_steps // 10))),
+            min_lr_ratio=0.1,
+        )
+        set_optimizer_lr(opt, lr, mult)
         opt.zero_grad(set_to_none=True)
         total_loss = 0.0
         for _ in range(grad_accum_steps):
@@ -126,7 +143,7 @@ def run_preference_tuning(
             r_mask = batch["rejected_mask"].to(device)
 
             with amp_ctx:
-                c_out = policy(c_ids, targets=c_lbl, attention_mask=c_mask)
+                c_out = policy(c_ids, targets=c_lbl if use_orpo else None, attention_mask=c_mask)
                 r_out = policy(r_ids, attention_mask=r_mask)
                 p_c = sequence_logps(c_out.logits, c_lbl)
                 p_r = sequence_logps(r_out.logits, r_lbl)
@@ -156,7 +173,7 @@ def run_preference_tuning(
 
         if step % 10 == 0:
             mode = "orpo" if use_orpo else "dpo"
-            print(f"[{mode} step {step:5d}] loss={total_loss:.4f}")
+            print(f"[{mode} step {step:5d}] loss={total_loss:.4f} lr_mult={mult:.3f}")
 
     save_checkpoint(Path(output_dir) / "final.pt", policy, model_cfg, total_steps)
 

@@ -12,10 +12,10 @@ from tokenisers import WpBpePpigTokenizer
 from torch.utils.data import DataLoader
 
 from crouton.config import CroutonConfig, TrainConfig
-from crouton.data import StreamingPackedDataset
+from crouton.data import StreamingPackedDataset, resolve_token_id
 from crouton.model import CroutonForCausalLM
 from crouton.optim import build_optimizers, set_optimizer_lr, wsd_lr_multiplier
-from crouton.train.common import get_device, save_checkpoint
+from crouton.train.common import get_device, save_checkpoint, unwrap_model
 
 
 @torch.no_grad()
@@ -27,16 +27,19 @@ def run_validation_bpb(
     device: torch.device,
     amp_ctx,
 ) -> tuple[float, float]:
-    was_training = model.training
-    model.eval()
+    raw_model = unwrap_model(model)
+    was_training = raw_model.training
+    raw_model.eval()
+    eos_id = resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
     total_nll = 0.0
     total_tokens = 0
     total_bytes = 0
 
     for text in val_texts:
-        ids = tokenizer.encode(text)
-        if len(ids) < 2:
+        doc_ids = tokenizer.encode(text)
+        if not doc_ids:
             continue
+        ids = [eos_id] + doc_ids
         for start in range(0, len(ids) - 1, seq_len):
             chunk = ids[start : start + seq_len + 1]
             if len(chunk) < 2:
@@ -44,14 +47,14 @@ def run_validation_bpb(
             x = torch.tensor([chunk[:-1]], dtype=torch.long, device=device)
             y = torch.tensor([chunk[1:]], dtype=torch.long, device=device)
             with amp_ctx:
-                out = model(x, targets=y)
+                out = raw_model(x, targets=y)
             n_tok = y.numel()
             total_nll += float(out.loss.item()) * n_tok
             total_tokens += n_tok
         total_bytes += len(text.encode("utf-8"))
 
     if was_training:
-        model.train()
+        raw_model.train()
     avg_loss = total_nll / max(1, total_tokens)
     bpb = (total_nll / math.log(2.0)) / max(1, total_bytes)
     return avg_loss, bpb
@@ -87,15 +90,15 @@ def run_pretrain(
     )
     loader = iter(DataLoader(dataset, batch_size=train_cfg.micro_batch_size))
 
-    model = CroutonForCausalLM(model_cfg).to(device)
-    if train_cfg.compile_model and device.type == "cuda":
-        model = torch.compile(model)
-
+    raw_model = CroutonForCausalLM(model_cfg).to(device)
     muon_opt, adamw_opt = build_optimizers(
-        model,
+        raw_model,
         muon_lr=train_cfg.muon_lr,
         adamw_lr=train_cfg.adamw_lr,
         weight_decay=train_cfg.weight_decay,
+    )
+    model: torch.nn.Module = (
+        torch.compile(raw_model) if (train_cfg.compile_model and device.type == "cuda") else raw_model
     )
 
     model.train()

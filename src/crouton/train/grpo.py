@@ -1,4 +1,4 @@
-"""Stage 3b Post-Training: GRPO for verifiable math/reasoning tasks."""
+"""Stage 3b Post-Training: GRPO with per-token ratios and Schulman k3 KL."""
 
 from __future__ import annotations
 
@@ -17,23 +17,32 @@ from torch.optim import AdamW
 from crouton.data.pretrain_data import resolve_token_id
 from crouton.train.common import get_device, load_checkpoint, save_checkpoint
 
-_NUM_RE = re.compile(r"####\s*(-?\d+(?:\.\d+)?)|(-?\d+(?:\.\d+)?)")
+_HASHED_NUM_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
+_BARE_NUM_RE = re.compile(r"-?[\d,]+(?:\.\d+)?")
+
+
+def _clean_num_str(raw: str) -> str | None:
+    cleaned = raw.replace(",", "").strip()
+    return cleaned if cleaned and any(ch.isdigit() for ch in cleaned) else None
 
 
 def extract_numeric_answer(text: str) -> str | None:
-    matches = _NUM_RE.findall(text)
-    if not matches:
-        return None
-    for hashed, bare in reversed(matches):
-        if hashed:
-            return hashed
-        if bare:
-            return bare
+    hashed = _HASHED_NUM_RE.findall(text)
+    if hashed:
+        for val in reversed(hashed):
+            cleaned = _clean_num_str(val)
+            if cleaned is not None:
+                return cleaned
+    bare = _BARE_NUM_RE.findall(text)
+    for val in reversed(bare):
+        cleaned = _clean_num_str(val)
+        if cleaned is not None:
+            return cleaned
     return None
 
 
 def make_numeric_verifier(expected: str) -> Callable[[str], float]:
-    target = expected.strip()
+    target = expected.replace(",", "").strip()
 
     def _verify(response: str) -> float:
         pred = extract_numeric_answer(response)
@@ -87,23 +96,59 @@ def grpo_step_loss(
     old_logps: torch.Tensor,
     ref_logps: torch.Tensor,
     rewards: torch.Tensor,
+    completion_mask: torch.Tensor | None = None,
     clip_eps: float = 0.2,
     kl_beta: float = 0.04,
 ) -> torch.Tensor:
     """
     Compute Group Relative Policy Optimization (GRPO) loss over G completions.
-    `policy_logps`, `old_logps`, `ref_logps`, `rewards` have shape [G].
+    Supports per-token logprobs [G, T] with optional boolean mask [G, T] (preferred)
+    or 1D [G] logprobs.
     """
-    std = rewards.std()
+    std = rewards.std(unbiased=False)
     advantages = (rewards - rewards.mean()) / (std + 1e-6) if std > 1e-8 else torch.zeros_like(rewards)
-    ratio = torch.exp(policy_logps - old_logps)
-    unclipped = ratio * advantages
-    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
-    pg_loss = -torch.min(unclipped, clipped).mean()
 
-    log_r = ref_logps - policy_logps
-    kl = (torch.exp(log_r) - log_r - 1.0).mean()
-    return pg_loss + kl_beta * kl
+    if policy_logps.ndim == 2:
+        adv = advantages.unsqueeze(-1)
+        mask = completion_mask.float() if completion_mask is not None else torch.ones_like(policy_logps)
+    else:
+        adv = advantages
+        mask = completion_mask.float() if completion_mask is not None else torch.ones_like(policy_logps)
+
+    ratio = torch.exp((policy_logps - old_logps).clamp(min=-20.0, max=20.0))
+    unclipped = ratio * adv
+    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+    pg_loss = -torch.min(unclipped, clipped)
+
+    # Per-token Schulman k3 KL estimator: exp(ref - policy) - (ref - policy) - 1
+    log_r = (ref_logps - policy_logps).clamp(min=-20.0, max=20.0)
+    kl = torch.exp(log_r) - log_r - 1.0
+    per_elem = pg_loss + kl_beta * kl
+
+    if per_elem.ndim == 2:
+        return ((per_elem * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1.0)).mean()
+    return (per_elem * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def _gather_completion_logps(
+    model: torch.nn.Module,
+    seq: torch.Tensor,
+    prompt_len: int,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Return per-token log-probabilities [T_gen] for generated tokens seq[0, prompt_len:]."""
+    inp = seq[:, :-1]
+    tgt = seq[:, prompt_len:]
+    if inp.size(1) > max_seq_len:
+        offset = inp.size(1) - max_seq_len
+        inp = inp[:, -max_seq_len:]
+        start_logit = max(0, prompt_len - 1 - offset)
+    else:
+        start_logit = prompt_len - 1
+    logits = model(inp).logits[:, start_logit:, :].float()
+    logits = logits[:, : tgt.size(1), :]
+    log_probs = F.log_softmax(logits, dim=-1)
+    return torch.gather(log_probs, -1, tgt.unsqueeze(-1)).squeeze(-1).squeeze(0)
 
 
 def run_grpo(
@@ -140,13 +185,16 @@ def run_grpo(
 
     for step in range(steps):
         prompt, verifier = prompts_with_verifiers[step % len(prompts_with_verifiers)]
-        p_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
+        raw_p_ids = tokenizer.encode(prompt) or [eos_ids[0]]
+        max_prompt = max(1, model_cfg.max_seq_len - max_new_tokens)
+        raw_p_ids = raw_p_ids[-max_prompt:]
+        p_ids = torch.tensor([raw_p_ids], dtype=torch.long, device=device)
         p_len = p_ids.size(1)
 
-        completions = []
-        rewards = []
-        old_logps = []
-        ref_logps = []
+        completions: list[torch.Tensor] = []
+        rewards: list[float] = []
+        old_tok_logps: list[torch.Tensor] = []
+        ref_tok_logps: list[torch.Tensor] = []
 
         policy.eval()
         for _ in range(group_size):
@@ -162,26 +210,34 @@ def run_grpo(
             rewards.append(verifier(text))
 
             with torch.no_grad(), amp_ctx:
-                p_logits = F.log_softmax(policy(seq[:, :-1]).logits[:, p_len - 1 :, :].float(), dim=-1)
-                r_logits = F.log_softmax(ref_model(seq[:, :-1]).logits[:, p_len - 1 :, :].float(), dim=-1)
-                tgt = seq[:, p_len:].unsqueeze(-1)
-                old_logps.append(torch.gather(p_logits, -1, tgt).sum())
-                ref_logps.append(torch.gather(r_logits, -1, tgt).sum())
+                old_tok_logps.append(_gather_completion_logps(policy, seq, p_len, model_cfg.max_seq_len))
+                ref_tok_logps.append(_gather_completion_logps(ref_model, seq, p_len, model_cfg.max_seq_len))
 
         policy.train()
         opt.zero_grad(set_to_none=True)
-        cur_logps = []
+        cur_tok_logps: list[torch.Tensor] = []
         for seq in completions:
             with amp_ctx:
-                logits = F.log_softmax(policy(seq[:, :-1]).logits[:, p_len - 1 :, :].float(), dim=-1)
-                tgt = seq[:, p_len:].unsqueeze(-1)
-                cur_logps.append(torch.gather(logits, -1, tgt).sum())
+                cur_tok_logps.append(_gather_completion_logps(policy, seq, p_len, model_cfg.max_seq_len))
+
+        max_gen = max(t.numel() for t in cur_tok_logps)
+        padded_cur = torch.zeros((group_size, max_gen), dtype=torch.float32, device=device)
+        padded_old = torch.zeros((group_size, max_gen), dtype=torch.float32, device=device)
+        padded_ref = torch.zeros((group_size, max_gen), dtype=torch.float32, device=device)
+        comp_mask = torch.zeros((group_size, max_gen), dtype=torch.bool, device=device)
+        for g in range(group_size):
+            n = cur_tok_logps[g].numel()
+            padded_cur[g, :n] = cur_tok_logps[g]
+            padded_old[g, :n] = old_tok_logps[g]
+            padded_ref[g, :n] = ref_tok_logps[g]
+            comp_mask[g, :n] = True
 
         loss = grpo_step_loss(
-            policy_logps=torch.stack(cur_logps),
-            old_logps=torch.stack(old_logps),
-            ref_logps=torch.stack(ref_logps),
+            policy_logps=padded_cur,
+            old_logps=padded_old,
+            ref_logps=padded_ref,
             rewards=torch.tensor(rewards, dtype=torch.float32, device=device),
+            completion_mask=comp_mask,
             kl_beta=kl_beta,
         )
         loss.backward()
