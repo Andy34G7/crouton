@@ -1,4 +1,4 @@
-"""RMSNorm layer."""
+"""RMSNorm layer with fp32 accumulation for bf16 autocast safety."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(F, "rms_norm"):
-            return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
+            return F.rms_norm(x.float(), self.weight.shape, self.weight.float(), self.eps).to(x.dtype)
         x_float = x.float()
         normed = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return (normed * self.weight.float()).to(x.dtype)

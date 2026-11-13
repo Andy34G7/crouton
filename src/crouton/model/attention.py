@@ -1,6 +1,8 @@
-"""Hybrid Sliding Window + Global Attention with sink tokens and cached FlexAttention masks."""
+"""Hybrid Sliding Window + Global Attention with sink tokens and compile-safe FlexAttention masks."""
 
 from __future__ import annotations
+
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -11,16 +13,16 @@ from crouton.model.norm import RMSNorm
 from crouton.model.rope import apply_rope
 
 try:
-    from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
     HAS_FLEX_ATTENTION = True
 except ImportError:
     HAS_FLEX_ATTENTION = False
-    BlockMask = object  # type: ignore[assignment,misc]
     create_block_mask = None
     flex_attention = None
 
-_BLOCK_MASK_CACHE: dict[tuple[int, int, int, str], object] = {}
+_BLOCK_MASK_CACHE: OrderedDict[tuple[int, int, int, str, int | None], object] = OrderedDict()
+_MAX_MASK_CACHE = 16
 
 
 def build_swa_sink_mask(
@@ -39,15 +41,17 @@ def build_swa_sink_mask(
     return mask.unsqueeze(0).unsqueeze(0)
 
 
+@torch.compiler.disable
 def _get_cached_swa_block_mask(
     seq_len: int,
     window_size: int,
     sink_tokens: int,
     device: torch.device,
 ):
-    key = (seq_len, window_size, sink_tokens, str(device))
+    key = (seq_len, window_size, sink_tokens, device.type, device.index)
     cached = _BLOCK_MASK_CACHE.get(key)
     if cached is not None:
+        _BLOCK_MASK_CACHE.move_to_end(key)
         return cached
 
     def swa_sink_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
@@ -65,6 +69,8 @@ def _get_cached_swa_block_mask(
         device=device,
     )
     _BLOCK_MASK_CACHE[key] = block_mask
+    if len(_BLOCK_MASK_CACHE) > _MAX_MASK_CACHE:
+        _BLOCK_MASK_CACHE.popitem(last=False)
     return block_mask
 
 
@@ -120,9 +126,11 @@ class HybridSparseAttention(nn.Module):
 
         q, k = apply_rope(q, k, cos, sin)
 
+        # Avoid O(T^2) dense mask overhead when batch has no padding tokens (outside torch.compile).
+        if attention_mask is not None and not torch.compiler.is_compiling() and bool(attention_mask.all().item()):
+            attention_mask = None
+
         if attention_mask is not None:
-            # attention_mask: [B, T] boolean or 0/1 where 1/True = keep token.
-            # Keep self-attention valid for padded queries so softmax never receives all -inf rows.
             key_keep = attention_mask[:, None, None, :].bool()  # [B, 1, 1, T]
             if self.is_global:
                 base_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device))

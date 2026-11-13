@@ -112,11 +112,12 @@ class CroutonForCausalLM(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-100,
-            )
+            flat_targets = targets.view(-1)
+            if (flat_targets != -100).any():
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), flat_targets, ignore_index=-100)
+            else:
+                # Guard against 0/0 NaN when an entire microbatch is masked out (-100).
+                loss = logits.sum() * 0.0
 
         router_entropy = torch.stack(entropies).mean() if entropies else None
         return CroutonOutput(logits=logits, loss=loss, router_entropy=router_entropy)
@@ -130,7 +131,7 @@ class CroutonForCausalLM(nn.Module):
         top_k: int = 0,
         eos_token_ids: set[int] | list[int] | None = None,
     ) -> torch.Tensor:
-        """Autoregressive generation with optional top-k sampling and EOS stopping."""
+        """Autoregressive generation with fp32 sampling, top-k filtering, and EOS stopping."""
         was_training = self.training
         self.eval()
         eos_set = set(eos_token_ids) if eos_token_ids is not None else set()
@@ -139,7 +140,7 @@ class CroutonForCausalLM(nn.Module):
 
         for _ in range(max_new_tokens):
             ctx_ids = ids[:, -self.config.max_seq_len :]
-            logits = self(ctx_ids).logits[:, -1, :]
+            logits = self(ctx_ids).logits[:, -1, :].float()
             if temperature <= 0.0:
                 next_tok = logits.argmax(dim=-1, keepdim=True)
             else:

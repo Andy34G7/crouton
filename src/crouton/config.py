@@ -38,6 +38,8 @@ class CroutonConfig:
     use_flex_attention: bool = True
 
     def __post_init__(self) -> None:
+        if self.vocab_size < 1:
+            raise ValueError(f"vocab_size ({self.vocab_size}) must be >= 1")
         if self.d_model % self.n_heads != 0:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         if self.n_heads % self.n_kv_heads != 0:
@@ -46,8 +48,12 @@ class CroutonConfig:
             raise ValueError(f"head_dim ({self.head_dim}) must be even for RoPE")
         if self.global_layer_interval < 1:
             raise ValueError("global_layer_interval must be >= 1")
+        if self.sliding_window < 1 or self.sink_tokens < 0:
+            raise ValueError("sliding_window must be >= 1 and sink_tokens >= 0")
         if self.expert_rank < 1 or self.n_experts < 1:
             raise ValueError("expert_rank and n_experts must be >= 1")
+        if self.rope_scale_factor <= 0.0 or self.rope_original_max_seq_len < 1:
+            raise ValueError("rope_scale_factor must be > 0 and rope_original_max_seq_len >= 1")
         if self.rope_scaling_type not in ("yarn", "ntk"):
             raise ValueError(f"Unsupported rope_scaling_type: {self.rope_scaling_type!r}")
 

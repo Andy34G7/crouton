@@ -50,7 +50,6 @@ class RotaryEmbedding(nn.Module):
             effective_theta = theta * (scale_factor ** (head_dim / max(2, head_dim - 2)))
             inv_freq = 1.0 / (effective_theta ** (dim_range / head_dim))
         else:
-            # YaRN: wavelength-band ramp between interpolation (low freq) and extrapolation (high freq)
             inv_freq_extrap = 1.0 / (theta ** (dim_range / head_dim))
             inv_freq_interp = inv_freq_extrap / scale_factor
             half_dim = head_dim // 2
@@ -67,24 +66,26 @@ class RotaryEmbedding(nn.Module):
             self.mscale = 0.1 * math.log(scale_factor) + 1.0
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._max_seq_len_cached = 0
-        self._build_cache(max_seq_len)
+        cos_cached, sin_cached = self._compute_tables(max_seq_len, inv_freq)
+        self.register_buffer("cos_cached", cos_cached, persistent=False)
+        self.register_buffer("sin_cached", sin_cached, persistent=False)
+        self._max_seq_len_cached = max_seq_len
 
-    def _build_cache(self, seq_len: int) -> None:
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq)
+    def _compute_tables(self, seq_len: int, inv_freq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        t = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos() * self.mscale, persistent=False)
-        self.register_buffer("sin_cached", emb.sin() * self.mscale, persistent=False)
-        self._max_seq_len_cached = seq_len
+        return emb.cos() * self.mscale, emb.sin() * self.mscale
 
     def forward(self, seq_len: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        if seq_len > self._max_seq_len_cached:
-            self._build_cache(seq_len)
-        return (
-            self.cos_cached[:seq_len].to(dtype=dtype),
-            self.sin_cached[:seq_len].to(dtype=dtype),
-        )
+        if seq_len <= self._max_seq_len_cached:
+            return (
+                self.cos_cached[:seq_len].to(dtype=dtype),
+                self.sin_cached[:seq_len].to(dtype=dtype),
+            )
+        # Compute functionally when exceeding static cache to avoid buffer mutation inside torch.compile.
+        cos_ext, sin_ext = self._compute_tables(seq_len, self.inv_freq)
+        return cos_ext.to(dtype=dtype), sin_ext.to(dtype=dtype)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
