@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crouton"
+version = "0.1.0"
+description = "Dense Merged-LoRA MoE (ReLU^2) with Hybrid Sparse Attention & wp-bpe-ppig tokenizer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5.0",
+    "transformers>=5.21.0",
+    "datasets>=2.18.0",
+    "tokenisers",
+    "pyyaml>=6.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+eval = [
+    "lm-eval>=0.4.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv.sources]
+tokenisers = { path = "../tokenisers", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crouton"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
