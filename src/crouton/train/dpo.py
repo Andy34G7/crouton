@@ -205,7 +205,8 @@ def run_preference_tuning(
     it = iter(loader)
 
     opt = AdamW(build_adamw_param_groups(policy, weight_decay=0.01), lr=lr, betas=(0.9, 0.95))
-    policy.train()
+    # Keep policy in eval mode (matching ref_model) so optional router_jitter stays deterministic.
+    policy.eval()
 
     for step in range(total_steps):
         mult = wsd_lr_multiplier(

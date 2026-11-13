@@ -51,7 +51,7 @@ def test_forward_backward_yarn_ntk_and_generate():
         out_long = model(x_long)
         assert out_long.logits.shape == (1, 48, 512)
 
-    # Test attention_mask padding, all-(-100) NaN guard, and generate() with EOS stop
+    # Test attention_mask padding, all-(-100) NaN guard, vocab_limit guard, and generate() EOS stop
     prompt = torch.tensor([[1, 2, 3, 0, 0]], dtype=torch.long)
     mask = torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.bool)
     out_masked = model(prompt, attention_mask=mask)
@@ -64,6 +64,11 @@ def test_forward_backward_yarn_ntk_and_generate():
 
     gen = model.generate(prompt[:, :3], max_new_tokens=5, temperature=0.0, eos_token_ids=[999999])
     assert gen.shape == (1, 8)
+    first_tok = int(gen[0, 3].item())
+    gen_stop = model.generate(prompt[:, :3], max_new_tokens=5, temperature=0.0, eos_token_ids=[first_tok])
+    assert gen_stop.shape == (1, 4) and int(gen_stop[0, -1].item()) == first_tok
+    with pytest.raises(ValueError, match="vocab_limit"):
+        model.generate(prompt[:, :3], max_new_tokens=1, vocab_limit=0)
 
 
 def test_bf16_autocast_forward_backward():

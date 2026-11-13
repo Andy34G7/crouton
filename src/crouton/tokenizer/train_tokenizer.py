@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 
 from tokenisers import WpBpePpigTokenizer
@@ -57,12 +58,15 @@ def _validate_tokenizer_output_path(output_path: str | Path) -> Path:
     out_str = str(output_path).strip() if isinstance(output_path, (str, Path)) else ""
     if not out_str:
         raise ValueError("output_path must be non-empty")
+    has_trailing_sep = isinstance(output_path, str) and (
+        out_str.endswith(os.sep) or (os.altsep is not None and out_str.endswith(os.altsep))
+    )
     out = Path(out_str)
     for parent in out.parents:
         if (parent.exists() and not parent.is_dir()) or (parent.is_symlink() and not parent.exists()):
             raise ValueError(f"Tokenizer output parent path {str(parent)!r} exists and is not a directory")
     if out.suffix == ".json":
-        if out.is_dir() or (out.is_symlink() and not out.exists()):
+        if has_trailing_sep or out.is_dir() or (out.is_symlink() and not out.exists()):
             raise ValueError(f"Tokenizer JSON output path {out_str!r} must be a file path, not a directory")
     elif (out.exists() and not out.is_dir()) or (out.is_symlink() and not out.exists()):
         raise ValueError(f"Tokenizer output directory {out_str!r} exists and is not a directory")

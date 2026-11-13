@@ -174,13 +174,15 @@ class CroutonForCausalLM(nn.Module):
         else:
             logits = self.lm_head(x)
 
+        logits_fp32: torch.Tensor | None = None
         if self.config.logit_softcap > 0.0:
             cap = self.config.logit_softcap
-            logits = (cap * torch.tanh(logits.float() / cap)).to(logits.dtype)
+            logits_fp32 = cap * torch.tanh(logits.float() / cap)
+            logits = logits_fp32.to(logits.dtype)
 
         loss = None
         if targets is not None:
-            flat_logits = logits.float().view(-1, logits.size(-1))
+            flat_logits = (logits_fp32 if logits_fp32 is not None else logits.float()).view(-1, logits.size(-1))
             flat_targets = targets.reshape(-1)
             valid_mask = flat_targets != -100
             safe_targets = torch.where(valid_mask, flat_targets, 0)
@@ -204,6 +206,8 @@ class CroutonForCausalLM(nn.Module):
         """Autoregressive generation with fp32 sampling, top-k filtering, and EOS stopping."""
         if input_ids.size(1) < 1:
             raise ValueError("input_ids must have seq_len >= 1")
+        if vocab_limit is not None and vocab_limit < 1:
+            raise ValueError("vocab_limit must be >= 1 when specified")
         was_training = self.training
         self.eval()
         try:

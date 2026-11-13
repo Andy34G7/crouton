@@ -76,7 +76,7 @@ class StreamingPackedDataset(IterableDataset):
         from datasets import load_dataset
 
         epoch_offset = (
-            ((int(worker.seed) - worker_id) % (2**31 - 1))
+            ((int(worker.seed) - worker_id + self._iter_epoch) % (2**31 - 1))
             if worker is not None
             else self._iter_epoch
         ) * max(1, len(self.sources))

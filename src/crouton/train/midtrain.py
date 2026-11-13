@@ -38,6 +38,7 @@ def _validate_midtrain_args(
     muon_lr: float,
     adamw_lr: float,
     rope_scale_factor: float,
+    rope_scaling_type: str,
     dataset_name: str | None,
     subset: str | None,
     split: str,
@@ -59,8 +60,12 @@ def _validate_midtrain_args(
         raise ValueError(
             "warmup_steps and save_interval must be >= 0; muon_lr, adamw_lr, and rope_scale_factor must be finite > 0"
         )
+    if rope_scaling_type not in ("yarn", "ntk"):
+        raise ValueError("rope_scaling_type must be 'yarn' or 'ntk'")
     if dataset_name is not None and (not isinstance(dataset_name, str) or not dataset_name.strip()):
         raise ValueError("dataset_name must be non-empty when specified")
+    if subset is not None and not isinstance(subset, str):
+        raise ValueError("subset must be a string when specified")
     if local_file is not None and (not isinstance(local_file, str) or not local_file.strip()):
         raise ValueError("local_file must be non-empty when specified")
     if not isinstance(split, str) or not split.strip() or not isinstance(text_field, str) or not text_field.strip():
@@ -105,7 +110,6 @@ def run_midtrain(
         output_dir=output_dir,
     )
     validate_output_dir(output_dir)
-    subset = normalize_optional_subset(subset)
     _validate_midtrain_args(
         seq_len=seq_len,
         total_steps=total_steps,
@@ -116,12 +120,14 @@ def run_midtrain(
         muon_lr=muon_lr,
         adamw_lr=adamw_lr,
         rope_scale_factor=rope_scale_factor,
+        rope_scaling_type=rope_scaling_type,
         dataset_name=dataset_name,
         subset=subset,
         split=split,
         text_field=text_field,
         local_file=local_file,
     )
+    subset = normalize_optional_subset(subset)
     dataset_name = dataset_name.strip() if dataset_name is not None else None
     split = split.strip()
     text_field = text_field.strip()
@@ -256,6 +262,7 @@ def main() -> None:
             muon_lr=args.muon_lr,
             adamw_lr=args.adamw_lr,
             rope_scale_factor=args.rope_scale,
+            rope_scaling_type=args.rope_scaling,
             dataset_name=args.dataset,
             subset=args.subset,
             split=split,

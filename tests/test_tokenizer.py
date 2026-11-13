@@ -316,7 +316,12 @@ def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
         "iter_hf_corpus",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should fail output validation before streaming")),
     )
-    for bad_out in (str(conflict_dir), str(conflict_file), str(conflict_file / "tok.json")):
+    for bad_out in (
+        str(conflict_dir),
+        str(conflict_file),
+        str(conflict_file / "tok.json"),
+        f"{tmp_path / 'dir_slash.json'}/",
+    ):
         monkeypatch.setattr(sys, "argv", ["crouton-train-tokenizer", "--output", bad_out])
         with pytest.raises(SystemExit):
             tok_cli.main()

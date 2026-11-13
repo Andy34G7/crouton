@@ -158,7 +158,7 @@ def _gather_completion_logps(
     max_seq_len: int,
     vocab_limit: int | None = None,
 ) -> torch.Tensor:
-    """Return per-token log-probabilities [T_gen] for generated tokens seq[0, prompt_len:]."""
+    """Return per-token log-probabilities [min(T_gen, max_seq_len)] for generated tokens seq[0, prompt_len:], clipped to max_seq_len."""
     inp = seq[:, :-1]
     tgt = seq[:, prompt_len:]
     if inp.size(1) > max_seq_len:
@@ -199,6 +199,25 @@ def _validate_grpo_args(
         raise ValueError("temperature and lr must be finite > 0, and kl_beta / save_interval must be finite >= 0")
 
 
+_CHATML_PREFIX = "<|im_start|>user\n"
+_CHATML_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
+
+
+def _encode_grpo_prompt(tokenizer: WpBpePpigTokenizer, prompt: str) -> list[int]:
+    """Encode ChatML prompts while isolating raw user text from control tokens."""
+    if prompt.startswith(_CHATML_PREFIX) and prompt.endswith(_CHATML_SUFFIX):
+        body = prompt[len(_CHATML_PREFIX) : len(prompt) - len(_CHATML_SUFFIX)]
+        return (
+            list(tokenizer.encode("<|im_start|>"))
+            + list(tokenizer.encode("user\n", split_special_tokens=True))
+            + list(tokenizer.encode(body, split_special_tokens=True))
+            + list(tokenizer.encode("<|im_end|>\n"))
+            + list(tokenizer.encode("<|im_start|>"))
+            + list(tokenizer.encode("assistant\n", split_special_tokens=True))
+        )
+    return list(tokenizer.encode(prompt, split_special_tokens=True))
+
+
 def run_grpo(
     base_checkpoint: str,
     tokenizer_path: str,
@@ -223,6 +242,17 @@ def run_grpo(
     validate_output_dir(output_dir)
     if not prompts_with_verifiers:
         raise ValueError("prompts_with_verifiers must be non-empty")
+    task_list: list[tuple[str, Callable[[str], float]]] = []
+    for idx, item in enumerate(prompts_with_verifiers):
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError(f"prompts_with_verifiers[{idx}] must be a (prompt, verifier) pair")
+        prompt_text, verifier_fn = item
+        if not isinstance(prompt_text, str) or not prompt_text.strip() or not callable(verifier_fn):
+            raise ValueError(
+                f"prompts_with_verifiers[{idx}] must contain a non-empty prompt string and a callable verifier"
+            )
+        task_list.append((prompt_text, verifier_fn))
+    prompts_with_verifiers = task_list
     _validate_grpo_args(
         group_size=group_size,
         steps=steps,
@@ -240,13 +270,17 @@ def run_grpo(
 
     if _preloaded is not None:
         ckpt, model_cfg, tokenizer = _preloaded
+        if max_new_tokens >= model_cfg.max_seq_len:
+            raise ValueError(
+                f"max_new_tokens ({max_new_tokens}) must be < model max_seq_len ({model_cfg.max_seq_len})"
+            )
     else:
         ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint)
+        if max_new_tokens >= model_cfg.max_seq_len:
+            raise ValueError(
+                f"max_new_tokens ({max_new_tokens}) must be < model max_seq_len ({model_cfg.max_seq_len})"
+            )
         tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
-    if max_new_tokens >= model_cfg.max_seq_len:
-        raise ValueError(
-            f"max_new_tokens ({max_new_tokens}) must be < model max_seq_len ({model_cfg.max_seq_len})"
-        )
     validate_tokenizer_vocab(tokenizer, model_cfg)
 
     policy = instantiate_checkpoint_model(ckpt, model_cfg, device)
@@ -255,15 +289,13 @@ def run_grpo(
     for p in ref_model.parameters():
         p.requires_grad = False
 
-    eos_ids = [
-        resolve_token_id(tokenizer, "<|im_end|>", fallback=0),
-        resolve_token_id(tokenizer, "<|endoftext|>", fallback=0),
-    ]
+    eot_id = resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
+    eos_ids = list(dict.fromkeys([resolve_token_id(tokenizer, "<|im_end|>", fallback=eot_id), eot_id]))
     opt = AdamW(policy.parameters(), lr=lr, weight_decay=0.0)
 
     for step in range(steps):
         prompt, verifier = prompts_with_verifiers[step % len(prompts_with_verifiers)]
-        raw_p_ids = tokenizer.encode(prompt) or [eos_ids[0]]
+        raw_p_ids = _encode_grpo_prompt(tokenizer, prompt) or [eot_id]
         max_prompt = model_cfg.max_seq_len - max_new_tokens
         raw_p_ids = raw_p_ids[-max_prompt:]
         p_ids = torch.tensor([raw_p_ids], dtype=torch.long, device=device)

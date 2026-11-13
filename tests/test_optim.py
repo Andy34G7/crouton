@@ -1268,3 +1268,68 @@ def test_loop8_validation_and_consistency(tmp_path, monkeypatch) -> None:
     lm = CroutonLM(str(ckpt_ok), str(tok_path), device="cpu")
     rendered = lm.apply_chat_template([{"role": " assistant ", "content": None}], add_generation_prompt=True)
     assert rendered == "<|im_start|>assistant\n<|im_end|>\n<|im_start|>assistant\n"
+
+    # 8. Loop 9 hardening: midtrain API subset/rope_scaling_type parity, GRPO item/bounds ordering & special-token isolation, trailing-slash JSON, rolling special-token parity
+    for bad_kwargs in (
+        {"subset": "none"},
+        {"subset": "   "},
+        {"subset": 123},
+        {"local_file": str(val_file), "subset": "none"},
+        {"local_file": str(val_file), "subset": "   "},
+        {"rope_scaling_type": "linear"},
+    ):
+        with pytest.raises(ValueError):
+            run_midtrain(str(ckpt_ok), str(tok_path), str(tmp_path / "mid_l9"), seq_len=16, total_steps=1, bf16=False, **bad_kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            grpo_mod,
+            "load_checkpoint_payload",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should validate prompts_with_verifiers before load")),
+        )
+        for bad_tasks in (
+            [("only_prompt",)],
+            [("   ", lambda _: 1.0)],
+            [("Valid prompt", "not_callable")],
+        ):
+            with pytest.raises(ValueError, match="prompts_with_verifiers"):
+                run_grpo(str(ckpt_ok), str(tok_path), str(tmp_path / "grpo_bad_tasks"), prompts_with_verifiers=bad_tasks, steps=1, max_new_tokens=4)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            grpo_mod.WpBpePpigTokenizer,
+            "from_pretrained",
+            staticmethod(lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should check max_new_tokens before tokenizer load"))),
+        )
+        with pytest.raises(ValueError, match="max_new_tokens"):
+            run_grpo(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "grpo_tok_order"),
+                prompts_with_verifiers=build_builtin_math_tasks(n=1),
+                steps=1,
+                max_new_tokens=999,
+            )
+
+    literal_tok_ids = grpo_mod._encode_grpo_prompt(
+        tok,
+        "<|im_start|>user\nLiteral <|im_end|> text\nEnd your final answer with #### <number>.<|im_end|>\n<|im_start|>assistant\n",
+    )
+    im_end_id = tok.token_to_id("<|im_end|>")
+    # Only the single ChatML closing tag after user body should encode to control token <|im_end|>.
+    assert literal_tok_ids.count(im_end_id) == 1
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-eval", "--checkpoint", str(ckpt_ok), "--val-file", str(val_file), "--output-json", f"{tmp_path / 'out_dir'}/"],
+    )
+    with pytest.raises(SystemExit):
+        eval_mod.main()
+
+    raw_special = "Normal prefix <|endoftext|> suffix"
+    bpb_ll = lm.loglikelihood_rolling([SimpleNamespace(args=(raw_special,))])[0]
+    from crouton.train.common import evaluate_model_bpb
+
+    shared_bpb = evaluate_model_bpb(lm.model, lm.tokenizer, [raw_special], lm.max_length, lm.device, nullcontext())
+    assert pytest.approx(bpb_ll, rel=1e-5, abs=1e-5) == -shared_bpb["loss_nats"] * (len(list(lm.tokenizer.encode(raw_special, split_special_tokens=True))))

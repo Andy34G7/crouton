@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -265,7 +266,7 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         stride = max(1, self.max_length // 2)
         for req in requests:
             (text,) = req.args
-            ids = [self.eot_token_id] + self.tok_encode(text)
+            ids = [self.eot_token_id] + list(self.tokenizer.encode(text, split_special_tokens=True))
             if len(ids) < 2:
                 results.append(0.0)
                 continue
@@ -430,6 +431,8 @@ def main() -> None:
     if output_json is not None:
         if not output_json:
             parser.error("--output-json must be a non-empty path")
+        if output_json.endswith(os.sep) or (os.altsep is not None and output_json.endswith(os.altsep)):
+            parser.error("--output-json must be a file path, not a directory")
         out_json_path = Path(output_json)
         if out_json_path.is_dir() or (out_json_path.is_symlink() and not out_json_path.exists()):
             parser.error("--output-json must be a file path, not a directory")

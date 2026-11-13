@@ -1,4 +1,4 @@
-"""Configuration dataclasses for crouton models, pretraining, and post-training."""
+"""Configuration dataclasses for crouton models and pretraining."""
 
 from __future__ import annotations
 
