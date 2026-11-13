@@ -1,4 +1,4 @@
-"""Hybrid Sliding Window + Global Attention with sink tokens."""
+"""Hybrid Sliding Window + Global Attention with sink tokens and cached FlexAttention masks."""
 
 from __future__ import annotations
 
@@ -11,13 +11,16 @@ from crouton.model.norm import RMSNorm
 from crouton.model.rope import apply_rope
 
 try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
     HAS_FLEX_ATTENTION = True
 except ImportError:
     HAS_FLEX_ATTENTION = False
+    BlockMask = object  # type: ignore[assignment,misc]
     create_block_mask = None
     flex_attention = None
+
+_BLOCK_MASK_CACHE: dict[tuple[int, int, int, str], object] = {}
 
 
 def build_swa_sink_mask(
@@ -34,6 +37,35 @@ def build_swa_sink_mask(
     is_sink = kv_idx < sink_tokens
     mask = causal & (in_window | is_sink)
     return mask.unsqueeze(0).unsqueeze(0)
+
+
+def _get_cached_swa_block_mask(
+    seq_len: int,
+    window_size: int,
+    sink_tokens: int,
+    device: torch.device,
+):
+    key = (seq_len, window_size, sink_tokens, str(device))
+    cached = _BLOCK_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def swa_sink_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+        causal = q_idx >= kv_idx
+        in_window = (q_idx - kv_idx) < window_size
+        is_sink = kv_idx < sink_tokens
+        return causal & (in_window | is_sink)
+
+    block_mask = create_block_mask(
+        swa_sink_mask,
+        B=None,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+    )
+    _BLOCK_MASK_CACHE[key] = block_mask
+    return block_mask
 
 
 class HybridSparseAttention(nn.Module):
@@ -60,22 +92,10 @@ class HybridSparseAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.norm_eps) if config.qk_norm else None
 
     def _flex_swa_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        seq_len = q.shape[2]
-        window = self.sliding_window
-        sinks = self.sink_tokens
-
-        def swa_sink_mask(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
-            causal = q_idx >= kv_idx
-            in_window = (q_idx - kv_idx) < window
-            is_sink = kv_idx < sinks
-            return causal & (in_window | is_sink)
-
-        block_mask = create_block_mask(
-            swa_sink_mask,
-            B=None,
-            H=None,
-            Q_LEN=seq_len,
-            KV_LEN=seq_len,
+        block_mask = _get_cached_swa_block_mask(
+            seq_len=q.shape[2],
+            window_size=self.sliding_window,
+            sink_tokens=self.sink_tokens,
             device=q.device,
         )
         return flex_attention(q, k, v, block_mask=block_mask, enable_gqa=self.n_rep > 1)
@@ -85,6 +105,7 @@ class HybridSparseAttention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
 
@@ -99,7 +120,19 @@ class HybridSparseAttention(nn.Module):
 
         q, k = apply_rope(q, k, cos, sin)
 
-        if self.is_global:
+        if attention_mask is not None:
+            # attention_mask: [B, T] boolean or 0/1 where 1/True = keep token.
+            # Keep self-attention valid for padded queries so softmax never receives all -inf rows.
+            key_keep = attention_mask[:, None, None, :].bool()  # [B, 1, 1, T]
+            if self.is_global:
+                base_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device))
+                base_mask = base_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                base_mask = build_swa_sink_mask(seq_len, self.sliding_window, self.sink_tokens, q.device)
+            eye = torch.eye(seq_len, dtype=torch.bool, device=q.device).unsqueeze(0).unsqueeze(0)
+            full_mask = (base_mask & key_keep) | eye
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=full_mask, enable_gqa=self.n_rep > 1)
+        elif self.is_global:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.n_rep > 1)
         elif self.use_flex and q.is_cuda:
             out = self._flex_swa_attention(q, k, v)

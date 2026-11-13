@@ -11,14 +11,14 @@ import yaml
 
 @dataclass
 class CroutonConfig:
-    """Scalable model configuration from tiny prototypes (~15M) to ~300M params."""
+    """Scalable model configuration from tiny prototypes (~14M) to ~300M params."""
 
     vocab_size: int = 32768
     d_model: int = 1024
     n_layers: int = 24
     n_heads: int = 16
     n_kv_heads: int = 4
-    d_ff: int = 2560
+    d_ff: int = 3072
     n_experts: int = 8
     expert_rank: int = 32
     expert_alpha: float = 32.0
@@ -28,6 +28,8 @@ class CroutonConfig:
     global_layer_interval: int = 4
     rope_theta: float = 10000.0
     rope_scale_factor: float = 1.0
+    rope_scaling_type: str = "yarn"  # "yarn" | "ntk"
+    rope_original_max_seq_len: int = 2048
     norm_eps: float = 1e-6
     tie_embeddings: bool = True
     qk_norm: bool = True
@@ -40,10 +42,14 @@ class CroutonConfig:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})")
+        if self.head_dim % 2 != 0:
+            raise ValueError(f"head_dim ({self.head_dim}) must be even for RoPE")
         if self.global_layer_interval < 1:
             raise ValueError("global_layer_interval must be >= 1")
         if self.expert_rank < 1 or self.n_experts < 1:
             raise ValueError("expert_rank and n_experts must be >= 1")
+        if self.rope_scaling_type not in ("yarn", "ntk"):
+            raise ValueError(f"Unsupported rope_scaling_type: {self.rope_scaling_type!r}")
 
     @property
     def head_dim(self) -> int:
@@ -107,6 +113,6 @@ class PostTrainConfig:
     lr: float = 2e-5
     weight_decay: float = 0.01
     grad_clip: float = 1.0
-    beta: float = 0.1  # DPO/ORPO/GRPO KL/margin coefficient
+    beta: float = 0.1
     bf16: bool = True
     seed: int = 42

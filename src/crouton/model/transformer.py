@@ -37,8 +37,9 @@ class CroutonBlock(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = x + self.attn(self.attn_norm(x), cos, sin)
+        x = x + self.attn(self.attn_norm(x), cos, sin, attention_mask=attention_mask)
         moe_out, router_weights = self.moe(self.moe_norm(x))
         x = x + moe_out
         return x, router_weights
@@ -56,6 +57,8 @@ class CroutonForCausalLM(nn.Module):
             max_seq_len=config.max_seq_len,
             theta=config.rope_theta,
             scale_factor=config.rope_scale_factor,
+            scaling_type=config.rope_scaling_type,
+            original_max_seq_len=config.rope_original_max_seq_len,
         )
         self.blocks = nn.ModuleList([CroutonBlock(config, layer_idx=i) for i in range(config.n_layers)])
         self.final_norm = RMSNorm(config.d_model, eps=config.norm_eps)
@@ -85,6 +88,7 @@ class CroutonForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> CroutonOutput:
         _, seq_len = input_ids.shape
         x = self.tok_emb(input_ids)
@@ -92,7 +96,7 @@ class CroutonForCausalLM(nn.Module):
 
         entropies = []
         for block in self.blocks:
-            x, rw = block(x, cos, sin)
+            x, rw = block(x, cos, sin, attention_mask=attention_mask)
             rw_f = rw.float().clamp(min=1e-8)
             entropies.append(-(rw_f * rw_f.log()).sum(dim=-1).mean())
 
@@ -116,3 +120,43 @@ class CroutonForCausalLM(nn.Module):
 
         router_entropy = torch.stack(entropies).mean() if entropies else None
         return CroutonOutput(logits=logits, loss=loss, router_entropy=router_entropy)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 128,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        eos_token_ids: set[int] | list[int] | None = None,
+    ) -> torch.Tensor:
+        """Autoregressive generation with optional top-k sampling and EOS stopping."""
+        was_training = self.training
+        self.eval()
+        eos_set = set(eos_token_ids) if eos_token_ids is not None else set()
+        ids = input_ids
+        finished = torch.zeros(ids.size(0), dtype=torch.bool, device=ids.device)
+
+        for _ in range(max_new_tokens):
+            ctx_ids = ids[:, -self.config.max_seq_len :]
+            logits = self(ctx_ids).logits[:, -1, :]
+            if temperature <= 0.0:
+                next_tok = logits.argmax(dim=-1, keepdim=True)
+            else:
+                scaled = logits / temperature
+                if top_k > 0:
+                    v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
+                    scaled = scaled.masked_fill(scaled < v[:, [-1]], float("-inf"))
+                probs = F.softmax(scaled, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+            ids = torch.cat([ids, next_tok], dim=-1)
+            if eos_set:
+                for idx in range(ids.size(0)):
+                    if int(next_tok[idx, 0].item()) in eos_set:
+                        finished[idx] = True
+                if finished.all():
+                    break
+
+        if was_training:
+            self.train()
+        return ids
