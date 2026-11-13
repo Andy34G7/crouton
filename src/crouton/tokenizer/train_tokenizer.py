@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 from pathlib import Path
 
 from tokenisers import WpBpePpigTokenizer

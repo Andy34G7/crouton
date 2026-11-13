@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from crouton.data import StreamingPackedDataset
 from crouton.optim import build_optimizers, set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import (
+    bf16_supported,
     get_device,
     load_checkpoint,
     next_or_restart,
@@ -39,9 +40,13 @@ def run_midtrain(
     split: str = "train",
     text_field: str = "text",
     local_file: str | None = None,
+    seed: int = 42,
 ) -> None:
+    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1:
+        raise ValueError("seq_len, total_steps, micro_batch_size, and grad_accum_steps must all be >= 1")
+    torch.manual_seed(seed)
     device = get_device()
-    use_bf16 = device.type == "cuda"
+    use_bf16 = bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     model, model_cfg, _ = load_checkpoint(
@@ -71,7 +76,7 @@ def run_midtrain(
         seq_len=seq_len,
         sources=sources,
         local_texts=local_texts,
-        shuffle_seed=1337,
+        shuffle_seed=seed + 1000,
     )
     dataloader = DataLoader(dataset, batch_size=micro_batch_size)
     loader = iter(dataloader)
@@ -131,6 +136,7 @@ def main() -> None:
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--local-file", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     subset = None if args.subset in (None, "none", "None", "") else args.subset
@@ -152,6 +158,7 @@ def main() -> None:
         split=args.split,
         text_field=args.text_field,
         local_file=args.local_file,
+        seed=args.seed,
     )
 
 

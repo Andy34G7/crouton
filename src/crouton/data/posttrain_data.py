@@ -65,6 +65,25 @@ def _pad_and_shift(
     )
 
 
+def _truncate_keep_supervision(
+    input_ids: list[int],
+    targets: list[int],
+    max_tokens: int,
+) -> tuple[list[int], list[int]]:
+    """Truncate sequence to max_tokens while preserving assistant supervision whenever present."""
+    if len(input_ids) <= max_tokens:
+        return input_ids, targets
+    tail_targets = targets[-max_tokens:]
+    if any(t != -100 for t in tail_targets[1:]):
+        return input_ids[-max_tokens:], tail_targets
+    last_sup = max((i for i, t in enumerate(targets) if t != -100), default=-1)
+    if last_sup >= 0:
+        end = last_sup + 1
+        start = max(0, end - max_tokens)
+        return input_ids[start:end], targets[start:end]
+    return input_ids[:max_tokens], targets[:max_tokens]
+
+
 def format_chatml_sft_with_mask(
     messages: list[dict[str, str]],
     tokenizer,
@@ -79,36 +98,8 @@ def format_chatml_sft_with_mask(
     """
     pad_id = resolve_token_id(tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0))
     input_ids, targets = _encode_chatml_messages(messages, tokenizer, mask_earlier_assistant_turns)
-
-    max_tokens = seq_len + 1
-    if len(input_ids) > max_tokens:
-        # Left-truncate when the tail contains supervised assistant tokens; otherwise slice around last supervised token.
-        tail_targets = targets[-max_tokens:]
-        if any(t != -100 for t in tail_targets[1:]):
-            input_ids = input_ids[-max_tokens:]
-            targets = tail_targets
-        else:
-            last_sup = max((i for i, t in enumerate(targets) if t != -100), default=-1)
-            if last_sup >= 0:
-                end = last_sup + 1
-                start = max(0, end - max_tokens)
-                input_ids = input_ids[start:end]
-                targets = targets[start:end]
-            else:
-                input_ids = input_ids[:max_tokens]
-                targets = targets[:max_tokens]
-
+    input_ids, targets = _truncate_keep_supervision(input_ids, targets, seq_len + 1)
     return _pad_and_shift(input_ids, targets, seq_len, pad_id)
-
-
-def format_chatml_sft(
-    messages: list[dict[str, str]],
-    tokenizer,
-    seq_len: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Backward-compatible helper returning (input_ids, targets)."""
-    x, y, _ = format_chatml_sft_with_mask(messages, tokenizer, seq_len)
-    return x, y
 
 
 class SFTDataset(Dataset):
@@ -142,8 +133,20 @@ class PreferenceDataset(Dataset):
 
     @staticmethod
     def _to_messages(prompt: str | list[dict[str, str]], response: str | list[dict[str, str]]) -> list[dict[str, str]]:
-        if isinstance(response, list) and all(isinstance(m, dict) and "role" in m and "content" in m for m in response):
-            return response
+        if isinstance(response, list):
+            if not response:
+                raise ValueError("Preference response message list must be non-empty")
+            if all(isinstance(m, dict) and "role" in m and "content" in m for m in response):
+                if (
+                    isinstance(prompt, list)
+                    and prompt
+                    and all(isinstance(m, dict) and "role" in m and "content" in m for m in prompt)
+                    and response[: len(prompt)] != prompt
+                ):
+                    return [*prompt, *response]
+                if isinstance(prompt, str) and prompt and response[0].get("role") == "assistant":
+                    return [{"role": "user", "content": prompt}, *response]
+                return response
         if isinstance(prompt, list) and all(isinstance(m, dict) and "role" in m and "content" in m for m in prompt):
             return [*prompt, {"role": "assistant", "content": "" if response is None else str(response)}]
         return [
@@ -165,12 +168,23 @@ class PreferenceDataset(Dataset):
                 c_msgs, self.tokenizer, self.seq_len, mask_earlier_assistant_turns=True
             )
             r_x, r_y, r_mask = c_x.clone(), c_y.clone(), c_mask.clone()
+        elif common_k == 0:
+            # No shared prefix exists (divergent prompts); truncate each side independently keeping assistant labels.
+            c_x, c_y, c_mask = format_chatml_sft_with_mask(
+                c_msgs, self.tokenizer, self.seq_len, mask_earlier_assistant_turns=True
+            )
+            r_x, r_y, r_mask = format_chatml_sft_with_mask(
+                r_msgs, self.tokenizer, self.seq_len, mask_earlier_assistant_turns=True
+            )
         else:
             shared_ids, _ = _encode_chatml_messages(c_msgs[:common_k], self.tokenizer, mask_earlier_assistant_turns=True)
             c_tail = c_msgs[common_k:]
             r_tail = r_msgs[common_k:]
 
-            if len(c_tail) == 1 and len(r_tail) == 1 and c_tail[0].get("role") == r_tail[0].get("role") == "assistant":
+            is_single_asst = (
+                len(c_tail) == 1 and len(r_tail) == 1 and c_tail[0].get("role") == r_tail[0].get("role") == "assistant"
+            )
+            if is_single_asst:
                 hdr = self.tokenizer.encode("<|im_start|>assistant\n")
                 shared_ids.extend(hdr)
                 c_raw = "" if c_tail[0].get("content") is None else str(c_tail[0].get("content"))
@@ -183,16 +197,24 @@ class PreferenceDataset(Dataset):
                 c_comp_ids, c_comp_tgt = _encode_chatml_messages(c_tail, self.tokenizer, mask_earlier_assistant_turns=True)
                 r_comp_ids, r_comp_tgt = _encode_chatml_messages(r_tail, self.tokenizer, mask_earlier_assistant_turns=True)
 
-            # Synchronize prompt truncation across chosen/rejected so both condition on identical prompt tokens.
+            # Synchronize shared-prompt truncation across chosen/rejected so both condition on identical prompt tokens.
             max_tokens = self.seq_len + 1
             max_comp = max(len(c_comp_ids), len(r_comp_ids))
             if len(shared_ids) + max_comp > max_tokens:
                 keep_prompt = max(0, max_tokens - max_comp)
                 if keep_prompt == 0 and shared_ids and max_comp >= max_tokens:
                     keep_prompt = min(len(shared_ids), max_tokens // 2)
-                    comp_budget = max_tokens - keep_prompt
-                    c_comp_ids, c_comp_tgt = c_comp_ids[:comp_budget], c_comp_tgt[:comp_budget]
-                    r_comp_ids, r_comp_tgt = r_comp_ids[:comp_budget], r_comp_tgt[:comp_budget]
+                comp_budget = max_tokens - keep_prompt
+                if len(c_comp_ids) > comp_budget:
+                    if is_single_asst:
+                        c_comp_ids, c_comp_tgt = c_comp_ids[:comp_budget], c_comp_tgt[:comp_budget]
+                    else:
+                        c_comp_ids, c_comp_tgt = _truncate_keep_supervision(c_comp_ids, c_comp_tgt, comp_budget)
+                if len(r_comp_ids) > comp_budget:
+                    if is_single_asst:
+                        r_comp_ids, r_comp_tgt = r_comp_ids[:comp_budget], r_comp_tgt[:comp_budget]
+                    else:
+                        r_comp_ids, r_comp_tgt = _truncate_keep_supervision(r_comp_ids, r_comp_tgt, comp_budget)
                 shared_ids = shared_ids[-keep_prompt:] if keep_prompt > 0 else []
 
             shared_tgt = [-100] * len(shared_ids)

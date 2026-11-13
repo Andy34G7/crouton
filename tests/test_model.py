@@ -1,5 +1,6 @@
 """Tests for Crouton model architecture, YaRN/NTK RoPE, attention_mask, generate(), and configs."""
 
+import pytest
 import torch
 
 from crouton.config import CroutonConfig
@@ -119,3 +120,46 @@ def test_yaml_configs_instantiate():
         cfg = CroutonConfig.from_yaml(name)
         assert cfg.d_model % cfg.n_heads == 0
         assert cfg.is_global_layer(cfg.n_layers - 1)
+
+
+def test_model_config_validation_and_optional_flags():
+    with pytest.raises(ValueError, match="max_seq_len"):
+        CroutonConfig(max_seq_len=0)
+    with pytest.raises(ValueError, match="d_model"):
+        CroutonConfig(d_model=65, n_heads=4)
+    with pytest.raises(ValueError, match="n_heads"):
+        CroutonConfig(n_heads=4, n_kv_heads=3)
+
+    cfg = CroutonConfig(
+        vocab_size=128,
+        d_model=64,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=128,
+        n_experts=4,
+        expert_rank=8,
+        max_seq_len=16,
+        sliding_window=4,
+        sink_tokens=2,
+        global_layer_interval=2,
+        tie_embeddings=False,
+        qk_norm=False,
+        logit_softcap=30.0,
+        router_jitter=0.05,
+        use_flex_attention=False,
+    )
+    model = CroutonForCausalLM(cfg)
+    assert model.lm_head.weight is not model.tok_emb.weight
+    model.train()
+    x = torch.randint(0, 128, (2, 8))
+    out = model(x, targets=x)
+    assert out.logits.abs().max().item() <= 30.0 + 1e-4
+    out.loss.backward()
+
+    # Check generate() respects vocab_limit and restores prior training mode
+    model.train()
+    gen = model.generate(x[:, :3], max_new_tokens=4, temperature=0.8, eos_token_ids=[127], vocab_limit=64)
+    assert gen.shape == (2, 7)
+    assert (gen[:, 3:] < 64).all()
+    assert model.training

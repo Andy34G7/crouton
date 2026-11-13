@@ -27,6 +27,16 @@ _BLOCK_MASK_CACHE: OrderedDict[tuple[int, int, int, str, int | None], object] = 
 _MAX_MASK_CACHE = 16
 
 
+def _supports_cuda_flex_attention(device: torch.device, seq_len: int) -> bool:
+    """Use FlexAttention only on Ampere+ CUDA GPUs for block-aligned or compiled lengths >= 128."""
+    if not HAS_FLEX_ATTENTION or device.type != "cuda" or seq_len < 128:
+        return False
+    if not torch.compiler.is_compiling() and seq_len % 128 != 0:
+        return False
+    dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_capability(dev_idx)[0] >= 8
+
+
 def build_swa_sink_mask(
     seq_len: int,
     window_size: int,
@@ -159,27 +169,26 @@ class HybridSparseAttention(nn.Module):
 
         if precomputed_mask is not None:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=precomputed_mask, enable_gqa=self.n_rep > 1)
-        elif attention_mask is not None and not torch.compiler.is_compiling() and bool(attention_mask.all().item()):
-            attention_mask = None
-
-        if precomputed_mask is not None:
-            pass
-        elif attention_mask is not None:
-            full_mask = build_padded_attn_mask(
-                attention_mask=attention_mask,
-                seq_len=seq_len,
-                is_global=self.is_global,
-                sliding_window=self.sliding_window,
-                sink_tokens=self.sink_tokens,
-            )
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=full_mask, enable_gqa=self.n_rep > 1)
-        elif self.is_global:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.n_rep > 1)
-        elif self.use_flex and q.is_cuda:
-            out = self._flex_swa_attention(q, k, v, block_mask=swa_block_mask)
         else:
-            attn_mask = build_swa_sink_mask(seq_len, self.sliding_window, self.sink_tokens, q.device)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=self.n_rep > 1)
+            if attention_mask is not None and not torch.compiler.is_compiling() and bool(attention_mask.all().item()):
+                attention_mask = None
+
+            if attention_mask is not None:
+                full_mask = build_padded_attn_mask(
+                    attention_mask=attention_mask,
+                    seq_len=seq_len,
+                    is_global=self.is_global,
+                    sliding_window=self.sliding_window,
+                    sink_tokens=self.sink_tokens,
+                )
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=full_mask, enable_gqa=self.n_rep > 1)
+            elif self.is_global:
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.n_rep > 1)
+            elif self.use_flex and _supports_cuda_flex_attention(q.device, seq_len):
+                out = self._flex_swa_attention(q, k, v, block_mask=swa_block_mask)
+            else:
+                attn_mask = build_swa_sink_mask(seq_len, self.sliding_window, self.sink_tokens, q.device)
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=self.n_rep > 1)
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_heads * self.head_dim)
         return self.wo(out)

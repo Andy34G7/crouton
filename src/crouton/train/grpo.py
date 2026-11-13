@@ -15,7 +15,14 @@ from tokenisers import WpBpePpigTokenizer
 from torch.optim import AdamW
 
 from crouton.data.pretrain_data import resolve_token_id
-from crouton.train.common import get_device, load_checkpoint, save_checkpoint, validate_tokenizer_vocab
+from crouton.train.common import (
+    bf16_supported,
+    get_device,
+    load_checkpoint,
+    safe_decode,
+    save_checkpoint,
+    validate_tokenizer_vocab,
+)
 
 _HASHED_NUM_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
 _BARE_NUM_RE = re.compile(r"-?[\d,]+(?:\.\d+)?")
@@ -73,13 +80,13 @@ def build_builtin_math_tasks(n: int = 128, seed: int = 42) -> list[tuple[str, Ca
 
 
 def load_gsm8k_tasks(max_examples: int = 1000) -> list[tuple[str, Callable[[str], float]]]:
+    if max_examples < 1:
+        raise ValueError("max_examples must be >= 1")
     from datasets import load_dataset
 
     ds = load_dataset("openai/gsm8k", "main", split="train", streaming=True)
     tasks: list[tuple[str, Callable[[str], float]]] = []
-    for i, row in enumerate(ds):
-        if i >= max_examples:
-            break
+    for row in ds:
         q = str(row.get("question", "")).strip()
         ans = extract_numeric_answer(str(row.get("answer", "")))
         if q and ans is not None:
@@ -88,6 +95,8 @@ def load_gsm8k_tasks(max_examples: int = 1000) -> list[tuple[str, Callable[[str]
                 f"<|im_start|>assistant\n"
             )
             tasks.append((prompt, make_numeric_verifier(ans)))
+            if len(tasks) >= max_examples:
+                break
     return tasks
 
 
@@ -162,14 +171,16 @@ def run_grpo(
     temperature: float = 0.8,
     lr: float = 1e-6,
     kl_beta: float = 0.04,
+    seed: int = 42,
 ) -> None:
     if not prompts_with_verifiers:
         raise ValueError("prompts_with_verifiers must be non-empty")
-    if max_new_tokens <= 0:
-        raise ValueError("max_new_tokens must be positive")
+    if steps < 1 or group_size < 1 or max_new_tokens < 1:
+        raise ValueError("steps, group_size, and max_new_tokens must be >= 1")
+    torch.manual_seed(seed)
 
     device = get_device()
-    use_bf16 = device.type == "cuda"
+    use_bf16 = bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     policy, model_cfg, _ = load_checkpoint(base_checkpoint, device=device)
@@ -189,7 +200,7 @@ def run_grpo(
     for step in range(steps):
         prompt, verifier = prompts_with_verifiers[step % len(prompts_with_verifiers)]
         raw_p_ids = tokenizer.encode(prompt) or [eos_ids[0]]
-        max_prompt = max(1, model_cfg.max_seq_len - max_new_tokens)
+        max_prompt = max(1, model_cfg.max_seq_len - min(max_new_tokens, max(1, model_cfg.max_seq_len // 2)))
         raw_p_ids = raw_p_ids[-max_prompt:]
         p_ids = torch.tensor([raw_p_ids], dtype=torch.long, device=device)
         p_len = p_ids.size(1)
@@ -206,9 +217,10 @@ def run_grpo(
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     eos_token_ids=eos_ids,
+                    vocab_limit=tokenizer.vocab_size,
                 )
             completions.append(seq)
-            text = tokenizer.decode(seq[0, p_len:].tolist())
+            text = safe_decode(tokenizer, seq[0, p_len:].tolist())
             rewards.append(verifier(text))
 
             with torch.no_grad(), amp_ctx:
@@ -266,10 +278,11 @@ def main() -> None:
     parser.add_argument("--kl-beta", type=float, default=0.04)
     parser.add_argument("--builtin-math", action="store_true", help="Use built-in arithmetic tasks instead of GSM8K")
     parser.add_argument("--max-examples", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     tasks = (
-        build_builtin_math_tasks(n=max(args.steps, 64))
+        build_builtin_math_tasks(n=max(args.steps, 64), seed=args.seed)
         if args.builtin_math
         else load_gsm8k_tasks(max_examples=args.max_examples)
     )
@@ -284,6 +297,7 @@ def main() -> None:
         temperature=args.temperature,
         lr=args.lr,
         kl_beta=args.kl_beta,
+        seed=args.seed,
     )
 
 

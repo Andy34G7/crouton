@@ -18,9 +18,9 @@ def resolve_token_id(tokenizer, token: str, fallback: int = 0) -> int:
 
 class StreamingPackedDataset(IterableDataset):
     """
-    Streams text documents from HuggingFace datasets (or local texts),
+    Streams text documents from HuggingFace datasets (or cycles non-empty local_texts),
     encodes with wp-bpe-ppig, appends EOS, and packs into fixed (seq_len + 1) chunks.
-    Supports multi-worker DataLoader sharding and terminates cleanly on stream exhaustion.
+    Supports multi-worker DataLoader sharding and terminates cleanly on HF stream exhaustion.
     """
 
     def __init__(
@@ -34,12 +34,20 @@ class StreamingPackedDataset(IterableDataset):
         shuffle_buffer: int = 1000,
     ) -> None:
         super().__init__()
+        if seq_len < 1:
+            raise ValueError("seq_len must be >= 1")
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.sources = sources or [
-            ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
-            ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
-        ]
+        self.sources = (
+            [
+                ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
+                ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
+            ]
+            if sources is None
+            else sources
+        )
+        if local_texts is None and not self.sources:
+            raise ValueError("StreamingPackedDataset sources must be non-empty when local_texts is None")
         self.local_texts = (
             [t for t in local_texts if isinstance(t, str) and t.strip()]
             if local_texts is not None
@@ -48,6 +56,7 @@ class StreamingPackedDataset(IterableDataset):
         self.eos_id = resolve_token_id(tokenizer, eos_token, fallback=0)
         self.shuffle_seed = shuffle_seed
         self.shuffle_buffer = shuffle_buffer
+        self._iter_epoch = 0
 
     def _iter_texts(self) -> Iterator[str]:
         worker = get_worker_info()
@@ -66,11 +75,13 @@ class StreamingPackedDataset(IterableDataset):
 
         from datasets import load_dataset
 
+        epoch_offset = self._iter_epoch * max(1, len(self.sources))
+        self._iter_epoch += 1
         iters = []
         for idx, (name, subset, split, _) in enumerate(self.sources):
             ds = load_dataset(name, subset, split=split, streaming=True)
             if self.shuffle_seed is not None:
-                ds = ds.shuffle(seed=self.shuffle_seed + idx, buffer_size=self.shuffle_buffer)
+                ds = ds.shuffle(seed=self.shuffle_seed + epoch_offset + idx, buffer_size=self.shuffle_buffer)
             iters.append(iter(ds))
         fields = [field for _, _, _, field in self.sources]
         exhausted: set[int] = set()

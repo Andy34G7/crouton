@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from crouton.data import PreferenceDataset
 from crouton.optim import build_adamw_param_groups, set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import (
+    bf16_supported,
     get_device,
     load_checkpoint,
     next_or_restart,
@@ -84,10 +85,14 @@ def run_preference_tuning(
     beta: float = 0.1,
     use_orpo: bool = False,
     max_examples: int = 20000,
+    seed: int = 42,
     pairs_override: list[dict[str, Any]] | None = None,
 ) -> None:
+    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1 or max_examples < 1:
+        raise ValueError("seq_len, total_steps, micro_batch_size, grad_accum_steps, and max_examples must be >= 1")
+    torch.manual_seed(seed)
     device = get_device()
-    use_bf16 = device.type == "cuda"
+    use_bf16 = bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     policy, model_cfg, _ = load_checkpoint(base_checkpoint, device=device, override_seq_len=seq_len)
@@ -106,9 +111,7 @@ def run_preference_tuning(
     else:
         raw = load_dataset(dataset_name, subset, split="train", streaming=True)
         pairs = []
-        for i, row in enumerate(raw):
-            if i >= max_examples:
-                break
+        for row in raw:
             if "prompt" in row and "chosen" in row and "rejected" in row:
                 pairs.append(
                     {
@@ -117,6 +120,8 @@ def run_preference_tuning(
                         "rejected": row["rejected"],
                     }
                 )
+                if len(pairs) >= max_examples:
+                    break
 
     if not pairs:
         raise ValueError(f"Preference dataset '{dataset_name}' yielded zero valid (prompt, chosen, rejected) pairs.")
@@ -208,6 +213,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--max-examples", type=int, default=20000)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     subset = None if args.subset in (None, "none", "None", "") else args.subset
@@ -225,6 +231,7 @@ def main() -> None:
         lr=args.lr,
         beta=args.beta,
         max_examples=args.max_examples,
+        seed=args.seed,
     )
 
 

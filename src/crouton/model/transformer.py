@@ -9,7 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from crouton.config import CroutonConfig
-from crouton.model.attention import HybridSparseAttention, _get_cached_swa_block_mask, build_padded_attn_mask
+from crouton.model.attention import (
+    HybridSparseAttention,
+    _get_cached_swa_block_mask,
+    _supports_cuda_flex_attention,
+    build_padded_attn_mask,
+    build_swa_sink_mask,
+)
 from crouton.model.moe import MergedLoRADenseMoE
 from crouton.model.norm import RMSNorm
 from crouton.model.rope import RotaryEmbedding
@@ -116,13 +122,21 @@ class CroutonForCausalLM(nn.Module):
         swa_block_mask = None
         global_padded_mask = None
         swa_padded_mask = None
-        if attention_mask is None and x.is_cuda and self._needs_flex_swa_mask:
-            swa_block_mask = _get_cached_swa_block_mask(
-                seq_len=seq_len,
-                window_size=self.config.sliding_window,
-                sink_tokens=self.config.sink_tokens,
-                device=x.device,
-            )
+        if attention_mask is None and self._has_swa_layers:
+            if self._needs_flex_swa_mask and _supports_cuda_flex_attention(x.device, seq_len):
+                swa_block_mask = _get_cached_swa_block_mask(
+                    seq_len=seq_len,
+                    window_size=self.config.sliding_window,
+                    sink_tokens=self.config.sink_tokens,
+                    device=x.device,
+                )
+            else:
+                swa_padded_mask = build_swa_sink_mask(
+                    seq_len=seq_len,
+                    window_size=self.config.sliding_window,
+                    sink_tokens=self.config.sink_tokens,
+                    device=x.device,
+                )
         elif attention_mask is not None:
             if self._has_global_layers:
                 global_padded_mask = build_padded_attn_mask(
@@ -178,36 +192,45 @@ class CroutonForCausalLM(nn.Module):
         temperature: float = 0.0,
         top_k: int = 0,
         eos_token_ids: set[int] | list[int] | None = None,
+        vocab_limit: int | None = None,
     ) -> torch.Tensor:
         """Autoregressive generation with fp32 sampling, top-k filtering, and EOS stopping."""
+        if input_ids.size(1) < 1:
+            raise ValueError("input_ids must have seq_len >= 1")
         was_training = self.training
         self.eval()
-        eos_tensor = (
-            torch.tensor(sorted(set(eos_token_ids)), dtype=torch.long, device=input_ids.device)
-            if eos_token_ids
-            else None
-        )
-        ids = input_ids
-        finished = torch.zeros(ids.size(0), dtype=torch.bool, device=ids.device)
+        try:
+            eos_tensor = (
+                torch.tensor(sorted(set(eos_token_ids)), dtype=torch.long, device=input_ids.device)
+                if eos_token_ids
+                else None
+            )
+            eos_fill = eos_tensor[:1].view(1, 1) if eos_tensor is not None else None
+            ids = input_ids
+            finished = torch.zeros(ids.size(0), dtype=torch.bool, device=ids.device)
 
-        for _ in range(max_new_tokens):
-            ctx_ids = ids[:, -self.config.max_seq_len :]
-            logits = self(ctx_ids).logits[:, -1, :].float()
-            if temperature <= 0.0:
-                next_tok = logits.argmax(dim=-1, keepdim=True)
-            else:
-                scaled = logits / temperature
-                if top_k > 0:
-                    v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
-                    scaled = scaled.masked_fill(scaled < v[:, [-1]], float("-inf"))
-                probs = F.softmax(scaled, dim=-1)
-                next_tok = torch.multinomial(probs, num_samples=1)
-            ids = torch.cat([ids, next_tok], dim=-1)
-            if eos_tensor is not None:
-                finished = finished | torch.isin(next_tok.squeeze(-1), eos_tensor)
-                if bool(finished.all().item()):
-                    break
-
-        if was_training:
-            self.train()
-        return ids
+            for _ in range(max(0, max_new_tokens)):
+                ctx_ids = ids[:, -self.config.max_seq_len :]
+                logits = self(ctx_ids).logits[:, -1, :].float()
+                if vocab_limit is not None and 0 < vocab_limit < logits.size(-1):
+                    logits = logits[:, :vocab_limit]
+                if temperature <= 0.0:
+                    next_tok = logits.argmax(dim=-1, keepdim=True)
+                else:
+                    scaled = logits / temperature
+                    if top_k > 0:
+                        v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
+                        scaled = scaled.masked_fill(scaled < v[:, [-1]], float("-inf"))
+                    probs = F.softmax(scaled, dim=-1)
+                    next_tok = torch.multinomial(probs, num_samples=1)
+                if eos_fill is not None:
+                    next_tok = torch.where(finished.unsqueeze(-1), eos_fill, next_tok)
+                ids = torch.cat([ids, next_tok], dim=-1)
+                if eos_tensor is not None:
+                    finished = finished | torch.isin(next_tok.squeeze(-1), eos_tensor)
+                    if bool(finished.all().item()):
+                        break
+            return ids
+        finally:
+            if was_training:
+                self.train()

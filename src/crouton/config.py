@@ -52,6 +52,8 @@ class CroutonConfig:
             raise ValueError("sliding_window must be >= 1 and sink_tokens >= 0")
         if self.expert_rank < 1 or self.n_experts < 1:
             raise ValueError("expert_rank and n_experts must be >= 1")
+        if self.max_seq_len < 1:
+            raise ValueError(f"max_seq_len ({self.max_seq_len}) must be >= 1")
         if self.rope_scale_factor <= 0.0 or self.rope_original_max_seq_len < 1:
             raise ValueError("rope_scale_factor must be > 0 and rope_original_max_seq_len >= 1")
         if self.rope_scaling_type not in ("yarn", "ntk"):
@@ -81,7 +83,7 @@ class CroutonConfig:
 
 @dataclass
 class TrainConfig:
-    """Pretraining & mid-training hyperparameters."""
+    """Pretraining hyperparameters."""
 
     output_dir: str = "checkpoints/pretrain"
     tokenizer_path: str = "artifacts/tokenizer/wp_bpe_ppig_32k.json"
@@ -101,24 +103,4 @@ class TrainConfig:
     log_interval: int = 10
     eval_interval: int = 500
     save_interval: int = 1000
-    seed: int = 42
-
-
-@dataclass
-class PostTrainConfig:
-    """Shared config for SFT, DPO/ORPO, and GRPO."""
-
-    base_checkpoint: str = "checkpoints/midtrain/final.pt"
-    output_dir: str = "checkpoints/sft"
-    tokenizer_path: str = "artifacts/tokenizer/wp_bpe_ppig_32k.json"
-    seq_len: int = 4096
-    micro_batch_size: int = 2
-    grad_accum_steps: int = 16
-    total_steps: int = 2000
-    warmup_steps: int = 100
-    lr: float = 2e-5
-    weight_decay: float = 0.01
-    grad_clip: float = 1.0
-    beta: float = 0.1
-    bf16: bool = True
     seed: int = 42

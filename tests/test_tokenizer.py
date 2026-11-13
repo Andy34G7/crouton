@@ -1,9 +1,10 @@
 """Tests for wp-bpe-ppig pretokenizer rules, JSON/dir export, ChatML SFT masking, and multi-turn prefs."""
 
+import pytest
 import torch
 from tokenisers import WpBpePpigTokenizer, _core
 
-from crouton.data import PreferenceDataset, format_chatml_sft_with_mask
+from crouton.data import PreferenceDataset, StreamingPackedDataset, format_chatml_sft_with_mask
 from crouton.tokenizer import build_crouton_pretokenizer
 from crouton.tokenizer.train_tokenizer import read_local_corpus, train_crouton_tokenizer
 
@@ -86,3 +87,31 @@ def test_train_wp_bpe_ppig_json_and_dir_and_sft_masking(tmp_path):
     assert c_sup == r_sup and c_sup > 0
     assert torch.equal(sync_item["chosen_ids"][: c_sup + 1], sync_item["rejected_ids"][: r_sup + 1])
     assert (sync_ds[1]["chosen_labels"] != -100).any()
+
+    # Pretokenizer with individual_digits=False keeps up to 3 digits grouped (Llama-3 \p{N}{1,3})
+    pt_grouped = build_crouton_pretokenizer(individual_digits=False)
+    segs_grouped = _core.pretokenize(b"Year 2026: 42+8=50", pt_grouped)
+    assert b"202" in segs_grouped and b"42" in segs_grouped and b"50" in segs_grouped
+
+    # Completely divergent multi-turn preference pairs (common_k == 0) and long prompt retain supervision
+    div_ds = PreferenceDataset(
+        pairs=[
+            {
+                "prompt": [{"role": "user", "content": "Short " * 30}],
+                "chosen": [{"role": "assistant", "content": "Yes"}],
+                "rejected": [{"role": "user", "content": "Other " * 25}, {"role": "assistant", "content": "No"}],
+            }
+        ],
+        tokenizer=tok,
+        seq_len=24,
+    )
+    div_item = div_ds[0]
+    assert (div_item["chosen_labels"] != -100).any()
+    assert (div_item["rejected_labels"] != -100).any()
+
+    # Empty response or empty streaming sources list fail loudly
+    bad_pref = PreferenceDataset(pairs=[{"prompt": "Q", "chosen": [], "rejected": "No"}], tokenizer=tok, seq_len=16)
+    with pytest.raises(ValueError, match="non-empty"):
+        _ = bad_pref[0]
+    with pytest.raises(ValueError, match="non-empty"):
+        StreamingPackedDataset(tokenizer=tok, seq_len=16, sources=[])

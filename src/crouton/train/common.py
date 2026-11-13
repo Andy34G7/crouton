@@ -3,16 +3,31 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import math
 from pathlib import Path
 from typing import Any, TypeVar
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from crouton.config import CroutonConfig
+from crouton.data.pretrain_data import resolve_token_id
 from crouton.model import CroutonForCausalLM
 
 _T = TypeVar("_T")
+
+
+def bf16_supported(device: torch.device) -> bool:
+    """Return True only when running on an Ampere+ CUDA GPU supporting native bfloat16."""
+    return device.type == "cuda" and torch.cuda.is_bf16_supported()
+
+
+def safe_decode(tokenizer, token_ids: list[int]) -> str:
+    """Decode generated token IDs, filtering any out-of-range untrained embedding slots."""
+    vsize = tokenizer.vocab_size
+    filtered = [int(t) for t in token_ids if 0 <= int(t) < vsize]
+    return tokenizer.decode(filtered)
 
 
 def validate_tokenizer_vocab(tokenizer, model_cfg: CroutonConfig) -> None:
@@ -52,11 +67,79 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def strip_orig_mod_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Normalize state_dict keys saved from torch.compile'd modules."""
-    prefix = "_orig_mod."
-    if not any(k.startswith(prefix) for k in state_dict):
-        return state_dict
-    return {k[len(prefix) :] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
+    """Normalize state_dict keys saved from torch.compile or DDP wrappers."""
+    out: dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        clean = k
+        while clean.startswith("_orig_mod.") or clean.startswith("module."):
+            clean = clean.removeprefix("_orig_mod.").removeprefix("module.")
+        out[clean] = v
+    return out
+
+
+@torch.no_grad()
+def evaluate_model_bpb(
+    model: torch.nn.Module,
+    tokenizer,
+    texts: list[str],
+    seq_len: int,
+    device: torch.device,
+    amp_ctx,
+) -> dict[str, float]:
+    """
+    Shared strided sliding-window BPB / PPL / NLL evaluator used by both pretraining validation
+    and offline eval_runner evaluation so validation curves match final eval identically.
+    """
+    if seq_len < 1:
+        raise ValueError(f"seq_len ({seq_len}) must be >= 1")
+    raw_model = unwrap_model(model)
+    was_training = raw_model.training
+    raw_model.eval()
+    try:
+        eos_id = resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
+        total_nll_nats = 0.0
+        total_tokens = 0
+        total_bytes = 0
+        stride = max(1, seq_len // 2)
+
+        for text in texts:
+            doc_ids = tokenizer.encode(text)
+            if not doc_ids:
+                continue
+            ids = [eos_id] + doc_ids
+            first_end = min(len(ids), seq_len + 1)
+            x = torch.tensor([ids[: first_end - 1]], dtype=torch.long, device=device)
+            y = torch.tensor([ids[1:first_end]], dtype=torch.long, device=device)
+            with amp_ctx:
+                out = raw_model(x, targets=y)
+            n_tok = y.numel()
+            total_nll_nats += float(out.loss.item()) * n_tok
+            total_tokens += n_tok
+
+            pos = first_end
+            while pos < len(ids):
+                end = min(len(ids), pos + stride)
+                cont_len = end - pos
+                win_start = max(0, end - (seq_len + 1))
+                win = ids[win_start:end]
+                x = torch.tensor([win[:-1]], dtype=torch.long, device=device)
+                y = torch.tensor([win[1:]], dtype=torch.long, device=device)
+                with amp_ctx:
+                    logits = raw_model(x).logits[0, -cont_len:].float()
+                loss = F.cross_entropy(logits, y[0, -cont_len:], reduction="sum")
+                total_nll_nats += float(loss.item())
+                total_tokens += cont_len
+                pos = end
+
+            total_bytes += len(text.encode("utf-8"))
+
+        avg_nats = total_nll_nats / max(1, total_tokens)
+        ppl = math.exp(min(avg_nats, 20.0))
+        bpb = (total_nll_nats / math.log(2.0)) / max(1, total_bytes)
+        return {"loss_nats": avg_nats, "ppl": ppl, "bpb": bpb, "tokens": float(total_tokens)}
+    finally:
+        if was_training:
+            raw_model.train()
 
 
 def save_checkpoint(

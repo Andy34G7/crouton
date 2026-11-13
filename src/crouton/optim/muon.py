@@ -14,7 +14,8 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor
     """Compute approximate orthogonalization G -> U V^T via 5-step Newton-Schulz."""
     assert G.ndim == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16() if G.is_cuda else G.float()
+    use_bf16 = G.is_cuda and torch.cuda.is_bf16_supported()
+    X = G.bfloat16() if use_bf16 else G.float()
     if G.size(0) > G.size(1):
         X = X.T
 

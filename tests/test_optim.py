@@ -1,5 +1,7 @@
 """Tests for Muon + AdamW, WSD, checkpoint _orig_mod handling, and end-to-end training/eval stages."""
 
+import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +14,14 @@ from crouton.eval import CroutonLM, evaluate_bpb
 from crouton.model import CroutonForCausalLM
 from crouton.optim import build_optimizers, wsd_lr_multiplier
 from crouton.tokenizer.train_tokenizer import train_crouton_tokenizer
-from crouton.train.common import load_checkpoint, next_or_restart, strip_orig_mod_prefix, validate_tokenizer_vocab
+from crouton.train.common import (
+    load_checkpoint,
+    next_or_restart,
+    safe_decode,
+    save_checkpoint,
+    strip_orig_mod_prefix,
+    validate_tokenizer_vocab,
+)
 from crouton.train.dpo import dpo_loss, orpo_loss, run_preference_tuning
 from crouton.train.grpo import (
     _gather_completion_logps,
@@ -22,7 +31,7 @@ from crouton.train.grpo import (
     run_grpo,
 )
 from crouton.train.midtrain import run_midtrain
-from crouton.train.pretrain import run_pretrain
+from crouton.train.pretrain import run_pretrain, run_validation_bpb
 from crouton.train.sft import run_sft
 
 
@@ -200,7 +209,7 @@ def test_strip_orig_mod_checkpoint_roundtrip(tmp_path):
     assert set(strip_orig_mod_prefix(prefixed).keys()) == set(loaded.state_dict().keys())
 
 
-def test_end_to_end_pipeline_and_eval_smoke(tmp_path):
+def test_end_to_end_pipeline_and_eval_smoke(tmp_path, monkeypatch):
     corpus = [
         "Dense MoE with ReLU^2 and sparse attention scales cleanly from 15M to 300M.",
         "Compute 12 + 30. End with #### 42.",
@@ -315,9 +324,23 @@ def test_end_to_end_pipeline_and_eval_smoke(tmp_path):
 
     lm = CroutonLM(str(grpo_ckpt), str(tok_path), device="cpu")
     ll_res = lm.loglikelihood([SimpleNamespace(args=("Hi", " Hello!"))])
-    ll_trailing = lm.loglikelihood([SimpleNamespace(args=("Hi ", "Hello!"))])
+    ll_nl = lm.loglikelihood([SimpleNamespace(args=("Q:\n", "42"))])
+    ll_nl_in_cont = lm.loglikelihood([SimpleNamespace(args=("Q:", "\n42"))])
     assert len(ll_res) == 1 and isinstance(ll_res[0][0], float)
-    assert ll_res[0] == ll_trailing[0]
+    # Preserving trailing '\n' in context avoids falsely scoring '\n' as part of digit continuation "42"
+    assert ll_nl[0] != ll_nl_in_cont[0]
+
+    # When leading-space tokens are merged in BPE, ("Dense", " MoE") and ("Dense ", "MoE") score identically
+    full_tok_path = tmp_path / "full_tok.json"
+    full_tok = train_crouton_tokenizer(corpus, output_path=full_tok_path, vocab_size=350)
+    full_cfg = _tiny_cfg()
+    full_cfg.vocab_size = full_tok.vocab_size
+    full_ckpt = tmp_path / "full_tok.pt"
+    save_checkpoint(full_ckpt, CroutonForCausalLM(full_cfg), full_cfg, step=1)
+    full_lm = CroutonLM(str(full_ckpt), str(full_tok_path), device="cpu")
+    assert full_lm.loglikelihood([SimpleNamespace(args=("Dense", " MoE"))]) == full_lm.loglikelihood(
+        [SimpleNamespace(args=("Dense ", "MoE"))]
+    )
 
     # Verify CroutonLM never triggers read-only @property device setters on LM bases
     assert isinstance(type(lm).device, property)
@@ -330,3 +353,116 @@ def test_end_to_end_pipeline_and_eval_smoke(tmp_path):
     assert len(roll_res) == 1 and isinstance(roll_res[0], float) and roll_res[0] < 0.0
     gen_res = lm.generate_until([SimpleNamespace(args=("Hi", {"max_gen_toks": 4, "until": "\n"}))])
     assert len(gen_res) == 1 and isinstance(gen_res[0], str)
+
+    # Verify sliding-window BPB parity between pretrain.run_validation_bpb and eval.evaluate_bpb
+    long_docs = [long_text, "Sparse attention and ReLU^2 MLPs scale cleanly across documents. " * 12]
+    bpb_eval = evaluate_bpb(str(grpo_ckpt), str(tok_path), long_docs, seq_len=16)
+    loaded_model, _, _ = load_checkpoint(str(grpo_ckpt), device=torch.device("cpu"))
+    val_loss, val_bpb = run_validation_bpb(
+        loaded_model, tok, long_docs, seq_len=16, device=torch.device("cpu"), amp_ctx=nullcontext()
+    )
+    assert pytest.approx(bpb_eval["loss_nats"], rel=1e-6) == val_loss
+    assert pytest.approx(bpb_eval["bpb"], rel=1e-6) == val_bpb
+
+    # Verify loglikelihood preserves newline / space before digits, and generate_until handles None kwargs
+    ll_nl = lm.loglikelihood([SimpleNamespace(args=("Q:\n", "42")), SimpleNamespace(args=("A: ", "42"))])
+    assert len(ll_nl) == 2 and all(isinstance(v[0], float) for v in ll_nl)
+    gen_edge = lm.generate_until(
+        [
+            SimpleNamespace(args=("Hi", {"until": None, "max_gen_toks": None, "top_k": None})),
+            SimpleNamespace(args=("Hi", {"max_gen_toks": 0})),
+        ]
+    )
+    assert len(gen_edge) == 2 and gen_edge[1] == ""
+    # Verify stop-string truncation picks the earliest occurrence regardless of `until` order
+    suffix_ids = torch.tensor([tok.encode("alpha beta STOP1 gamma STOP2")], dtype=torch.long)
+    monkeypatch.setattr(lm.model, "generate", lambda inp, *a, **k: torch.cat([inp, suffix_ids.to(inp.device)], dim=1))
+    stop_out = lm.generate_until([SimpleNamespace(args=("Hi", {"max_gen_toks": 32, "until": ["STOP2", "STOP1"]}))])
+    assert stop_out == ["alpha beta "]
+
+    # Verify TokenizerCompat + apply_chat_template + safe_decode + padded-vocab generation
+    assert lm.tokenizer.eos_token == "<|endoftext|>"
+    assert lm.tokenizer.pad_token_id == lm.eot_token_id
+    assert lm.tokenizer_name == "tok.json"
+    chat_str = lm.apply_chat_template([{"role": "user", "content": "2+2?"}], add_generation_prompt=True)
+    assert chat_str == "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n"
+    assert isinstance(safe_decode(tok, [0, tok.vocab_size + 50, 999999]), str)
+
+    padded_cfg = _tiny_cfg()
+    padded_cfg.vocab_size = tok.vocab_size + 32
+    padded_model = CroutonForCausalLM(padded_cfg)
+    padded_ckpt = tmp_path / "padded.pt"
+    save_checkpoint(padded_ckpt, padded_model, padded_cfg, step=1)
+    padded_lm = CroutonLM(str(padded_ckpt), str(tok_path), device="cpu")
+    padded_out = padded_lm.generate_until([SimpleNamespace(args=("Hi", {"max_gen_toks": 4}))])
+    assert len(padded_out) == 1 and isinstance(padded_out[0], str)
+
+
+def test_utils_and_cli_edge_cases(tmp_path, monkeypatch):
+    # Stacked _orig_mod / module prefix stripping and WSD edge schedules
+    assert strip_orig_mod_prefix({"_orig_mod.module._orig_mod.w": 1}) == {"w": 1}
+    assert wsd_lr_multiplier(0, total_steps=1, warmup_steps=0, decay_steps=0) == 1.0
+    assert 0.0 < wsd_lr_multiplier(0, total_steps=10, warmup_steps=4, decay_steps=4) <= 1.0
+
+    # pretrain --save-interval 0 runs without ZeroDivisionError
+    from crouton.train import pretrain as pretrain_mod
+    from crouton.train import sft as sft_mod
+
+    data_file = tmp_path / "local.txt"
+    data_file.write_text("Dense MoE transformer training text. " * 20, encoding="utf-8")
+    tok_path = tmp_path / "tok.json"
+    tok = train_crouton_tokenizer([data_file.read_text(encoding="utf-8")], output_path=tok_path, vocab_size=260)
+    assert tok.vocab_size <= 260
+
+    cfg_file = tmp_path / "tiny.yaml"
+    cfg_file.write_text("vocab_size: 300\nd_model: 32\nn_layers: 2\nn_heads: 4\nn_kv_heads: 2\nd_ff: 64\nn_experts: 2\nexpert_rank: 4\nmax_seq_len: 16\nsliding_window: 4\nsink_tokens: 2\nglobal_layer_interval: 2\nuse_flex_attention: false\n", encoding="utf-8")
+    out_dir = tmp_path / "pretrain_zero_save"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "crouton-pretrain",
+            "--model-config",
+            str(cfg_file),
+            "--tokenizer",
+            str(tok_path),
+            "--local-file",
+            str(data_file),
+            "--output-dir",
+            str(out_dir),
+            "--steps",
+            "1",
+            "--micro-batch",
+            "1",
+            "--grad-accum",
+            "1",
+            "--save-interval",
+            "0",
+        ],
+    )
+    pretrain_mod.main()
+    assert (out_dir / "final.pt").exists()
+
+    # sft --dataset custom leaves --subset as None instead of forcing smoltalk "all"
+    seen: dict[str, object] = {}
+
+    def _fake_sft(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(sft_mod, "run_sft", _fake_sft)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "crouton-sft",
+            "--base-checkpoint",
+            str(out_dir / "final.pt"),
+            "--dataset",
+            "custom/chat-dataset",
+            "--seed",
+            "123",
+        ],
+    )
+    sft_mod.main()
+    assert seen["subset"] is None
+    assert seen["seed"] == 123

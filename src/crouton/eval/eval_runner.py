@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,14 @@ import torch.nn.functional as F
 from tokenisers import WpBpePpigTokenizer
 
 from crouton.data.pretrain_data import resolve_token_id
-from crouton.train.common import get_device, load_checkpoint
+from crouton.train.common import (
+    bf16_supported,
+    evaluate_model_bpb,
+    get_device,
+    load_checkpoint,
+    safe_decode,
+    validate_tokenizer_vocab,
+)
 
 try:
     import lm_eval
@@ -25,6 +31,25 @@ except ImportError:
     HAS_LM_EVAL = False
     lm_eval = None
     LMEvalBase = object  # type: ignore[assignment,misc]
+
+
+class _TokenizerCompat:
+    """Expose HuggingFace-style metadata attributes on top of WpBpePpigTokenizer for lm-eval."""
+
+    def __init__(self, tokenizer: WpBpePpigTokenizer, tokenizer_path: str, eot_id: int) -> None:
+        self._tokenizer = tokenizer
+        self.name_or_path = tokenizer_path
+        self.eos_token = "<|endoftext|>"
+        self.eos_token_id = eot_id
+        self.pad_token = "<|endoftext|>"
+        self.pad_token_id = eot_id
+        self.bos_token = "<|endoftext|>"
+        self.bos_token_id = eot_id
+        self.unk_token = None
+        self.unk_token_id = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tokenizer, name)
 
 
 class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
@@ -44,10 +69,17 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         self._device = resolved_device
         self.model, self.model_cfg, _ = load_checkpoint(checkpoint_path, device=self._device)
         self.model.eval()
-        self.tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+        raw_tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+        validate_tokenizer_vocab(raw_tokenizer, self.model_cfg)
+        self._eot_id = resolve_token_id(raw_tokenizer, "<|endoftext|>", fallback=0)
+        self.tokenizer = _TokenizerCompat(raw_tokenizer, tokenizer_path=tokenizer_path, eot_id=self._eot_id)
+        self._tokenizer_path = tokenizer_path
         self._batch_size = batch_size
         self._max_gen_toks = max_gen_toks
-        self._eot_id = resolve_token_id(self.tokenizer, "<|endoftext|>", fallback=0)
+
+    @property
+    def tokenizer_name(self) -> str:
+        return Path(self._tokenizer_path).name
 
     @property
     def device(self) -> torch.device:
@@ -73,7 +105,17 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         return list(self.tokenizer.encode(string))
 
     def tok_decode(self, tokens: list[int], **kwargs) -> str:
-        return self.tokenizer.decode(tokens)
+        return safe_decode(self.tokenizer, tokens)
+
+    def apply_chat_template(self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True) -> str:
+        parts: list[str] = []
+        for msg in chat_history:
+            role = str(msg.get("role", "user")).strip() or "user"
+            content = str(msg.get("content", ""))
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
 
     @torch.no_grad()
     def _score_pair(self, context_ids: list[int], cont_ids: list[int]) -> tuple[float, bool]:
@@ -86,7 +128,7 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         x = torch.tensor([full[:-1]], dtype=torch.long, device=self.device)
         y = torch.tensor(full[1:], dtype=torch.long, device=self.device)
 
-        use_bf16 = self.device.type == "cuda"
+        use_bf16 = bf16_supported(self.device)
         amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
         with amp_ctx:
             logits = self.model(x).logits[0]  # [T, V]
@@ -105,11 +147,6 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
             if not cont:
                 results.append((0.0, True))
                 continue
-            # Move trailing whitespace from ctx onto cont for Llama-3/GPT-2 leading-space BPE parity.
-            n_spaces = len(ctx) - len(ctx.rstrip())
-            if n_spaces > 0:
-                cont = ctx[-n_spaces:] + cont
-                ctx = ctx[:-n_spaces]
 
             if not ctx:
                 ctx_ids = [self.eot_token_id]
@@ -129,7 +166,7 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
                     ctx_ids = ctx_ids[:prefix]
                     cont_ids = whole_ids[prefix:]
                 else:
-                    ctx_ids = ctx_ids[:-1] or [self.eot_token_id]
+                    ctx_ids = ctx_ids[: max(0, prefix - 1)] or [self.eot_token_id]
                     cont_ids = whole_ids[-1:]
             results.append(self._score_pair(ctx_ids, cont_ids))
         return results
@@ -165,21 +202,34 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
 
     def generate_until(self, requests) -> list[str]:
         outputs: list[str] = []
+        use_bf16 = bf16_supported(self.device)
+        amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
         for req in requests:
             ctx, gen_kwargs = req.args
             kwargs = gen_kwargs if isinstance(gen_kwargs, dict) else {}
-            raw_until = kwargs.get("until", [])
-            until = [raw_until] if isinstance(raw_until, str) else list(raw_until)
-            max_toks = int(kwargs.get("max_gen_toks", self.max_gen_toks))
-            do_sample = bool(kwargs.get("do_sample", False))
-            temp = float(kwargs.get("temperature", 0.0)) if do_sample else 0.0
-            top_k = int(kwargs.get("top_k", 0))
+            raw_until = kwargs.get("until")
+            if raw_until is None:
+                until: list[str] = []
+            elif isinstance(raw_until, str):
+                until = [raw_until]
+            else:
+                until = [str(s) for s in raw_until if s is not None]
 
-            max_prompt = max(1, self.max_length - max_toks)
+            raw_max = kwargs.get("max_gen_toks")
+            max_toks = self.max_gen_toks if raw_max is None else int(raw_max)
+            if max_toks <= 0:
+                outputs.append("")
+                continue
+
+            do_sample = bool(kwargs.get("do_sample", False))
+            raw_temp = kwargs.get("temperature")
+            temp = (1.0 if raw_temp is None else float(raw_temp)) if do_sample else 0.0
+            raw_topk = kwargs.get("top_k")
+            top_k = 0 if raw_topk is None else int(raw_topk)
+
+            max_prompt = max(1, self.max_length - min(max_toks, max(1, self.max_length // 2)))
             ctx_ids = self.tok_encode(ctx) or [self.eot_token_id]
             x = torch.tensor([ctx_ids[-max_prompt:]], dtype=torch.long, device=self.device)
-            use_bf16 = self.device.type == "cuda"
-            amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
             with amp_ctx:
                 seq = self.model.generate(
                     x,
@@ -187,14 +237,15 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
                     temperature=temp,
                     top_k=top_k,
                     eos_token_ids=[self.eot_token_id],
+                    vocab_limit=self.tokenizer.vocab_size,
                 )
             gen_ids = seq[0, x.size(1) :].tolist()
             if gen_ids and gen_ids[-1] == self.eot_token_id:
                 gen_ids = gen_ids[:-1]
             text = self.tok_decode(gen_ids)
-            for stop in until:
-                if stop and stop in text:
-                    text = text.split(stop, 1)[0]
+            stop_indices = [text.find(stop) for stop in until if stop and stop in text]
+            if stop_indices:
+                text = text[: min(stop_indices)]
             outputs.append(text)
         return outputs
 
@@ -213,53 +264,13 @@ def evaluate_bpb(
     """
     device = get_device()
     model, model_cfg, _ = load_checkpoint(checkpoint_path, device=device)
-    model.eval()
     eff_seq_len = seq_len if seq_len is not None else model_cfg.max_seq_len
+    if eff_seq_len < 1:
+        raise ValueError("seq_len must be >= 1")
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
-    eos_id = resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
-    use_bf16 = device.type == "cuda"
-    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
-
-    total_nll_nats = 0.0
-    total_tokens = 0
-    total_bytes = 0
-    stride = max(1, eff_seq_len // 2)
-
-    for text in texts:
-        doc_ids = tokenizer.encode(text)
-        if not doc_ids:
-            continue
-        ids = [eos_id] + doc_ids
-        first_end = min(len(ids), eff_seq_len + 1)
-        x = torch.tensor([ids[: first_end - 1]], dtype=torch.long, device=device)
-        y = torch.tensor([ids[1:first_end]], dtype=torch.long, device=device)
-        with amp_ctx:
-            out = model(x, targets=y)
-        n_tok = y.numel()
-        total_nll_nats += float(out.loss.item()) * n_tok
-        total_tokens += n_tok
-
-        pos = first_end
-        while pos < len(ids):
-            end = min(len(ids), pos + stride)
-            cont_len = end - pos
-            win_start = max(0, end - (eff_seq_len + 1))
-            win = ids[win_start:end]
-            x = torch.tensor([win[:-1]], dtype=torch.long, device=device)
-            y = torch.tensor([win[1:]], dtype=torch.long, device=device)
-            with amp_ctx:
-                logits = model(x).logits[0, -cont_len:].float()
-            loss = F.cross_entropy(logits, y[0, -cont_len:], reduction="sum")
-            total_nll_nats += float(loss.item())
-            total_tokens += cont_len
-            pos = end
-
-        total_bytes += len(text.encode("utf-8"))
-
-    avg_nats = total_nll_nats / max(1, total_tokens)
-    ppl = math.exp(min(avg_nats, 20.0))
-    bpb = (total_nll_nats / math.log(2.0)) / max(1, total_bytes)
-    return {"loss_nats": avg_nats, "ppl": ppl, "bpb": bpb, "tokens": float(total_tokens)}
+    validate_tokenizer_vocab(tokenizer, model_cfg)
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if bf16_supported(device) else nullcontext()
+    return evaluate_model_bpb(model, tokenizer, texts, eff_seq_len, device, amp_ctx)
 
 
 def evaluate_lm_eval(
@@ -267,10 +278,11 @@ def evaluate_lm_eval(
     tokenizer_path: str,
     tasks: list[str],
     limit: int | None = None,
+    batch_size: int = 1,
 ) -> dict[str, Any]:
     if not HAS_LM_EVAL:
         raise RuntimeError("lm-eval is not installed. Install with: uv sync --extra dev --extra eval")
-    lm = CroutonLM(checkpoint_path=checkpoint_path, tokenizer_path=tokenizer_path)
+    lm = CroutonLM(checkpoint_path=checkpoint_path, tokenizer_path=tokenizer_path, batch_size=batch_size)
     results = lm_eval.simple_evaluate(model=lm, tasks=tasks, limit=limit)
     return results.get("results", {})
 
@@ -283,6 +295,7 @@ def main() -> None:
     parser.add_argument("--val-file", type=str, default=None, help="UTF-8 validation text file for BPB/PPL")
     parser.add_argument("--tasks", type=str, default=None, help="Comma-separated lm-eval-harness tasks")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=None, help="Override BPB seq_len (defaults to checkpoint max_seq_len)")
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
@@ -301,10 +314,12 @@ def main() -> None:
 
     if args.tasks:
         task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
-        report["primary"]["lm_eval"] = evaluate_lm_eval(args.checkpoint, args.tokenizer, task_list, limit=args.limit)
+        report["primary"]["lm_eval"] = evaluate_lm_eval(
+            args.checkpoint, args.tokenizer, task_list, limit=args.limit, batch_size=args.batch_size
+        )
         if args.compare_checkpoint:
             report.setdefault("compare", {})["lm_eval"] = evaluate_lm_eval(
-                args.compare_checkpoint, args.tokenizer, task_list, limit=args.limit
+                args.compare_checkpoint, args.tokenizer, task_list, limit=args.limit, batch_size=args.batch_size
             )
 
     print(json.dumps(report, indent=2))

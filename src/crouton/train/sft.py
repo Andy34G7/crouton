@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from crouton.data import SFTDataset
 from crouton.optim import build_adamw_param_groups, set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import (
+    bf16_supported,
     get_device,
     load_checkpoint,
     next_or_restart,
@@ -41,9 +42,13 @@ def run_sft(
     lr: float = 2e-5,
     max_examples: int = 50000,
     examples_override: list[list[dict[str, str]]] | None = None,
+    seed: int = 42,
 ) -> None:
+    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1:
+        raise ValueError("seq_len, total_steps, micro_batch_size, and grad_accum_steps must all be >= 1")
+    torch.manual_seed(seed)
     device = get_device()
-    use_bf16 = device.type == "cuda"
+    use_bf16 = bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     model, model_cfg, _ = load_checkpoint(
@@ -59,12 +64,12 @@ def run_sft(
     else:
         raw = load_dataset(dataset_name, subset, split="train", streaming=True)
         examples = []
-        for i, row in enumerate(raw):
-            if i >= max_examples:
-                break
+        for row in raw:
             msgs = row.get("messages")
             if isinstance(msgs, list) and msgs:
                 examples.append(msgs)
+                if len(examples) >= max_examples:
+                    break
 
     if not examples:
         raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
@@ -121,20 +126,22 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default="checkpoints/sft")
     parser.add_argument("--preset", type=str, default=None, choices=["smoltalk", "tulu3"])
     parser.add_argument("--dataset", type=str, default="HuggingFaceTB/smoltalk")
-    parser.add_argument("--subset", type=str, default="all")
+    parser.add_argument("--subset", type=str, default=None)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--micro-batch", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--max-examples", type=int, default=50000)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     if args.preset is not None:
         dataset_name, subset = SFT_PRESETS[args.preset]
     else:
         dataset_name = args.dataset
-        subset = None if args.subset in (None, "none", "None", "") else args.subset
+        raw_sub = None if args.subset in (None, "none", "None", "") else args.subset
+        subset = "all" if (dataset_name == "HuggingFaceTB/smoltalk" and args.subset is None) else raw_sub
 
     run_sft(
         base_checkpoint=args.base_checkpoint,
@@ -148,6 +155,7 @@ def main() -> None:
         grad_accum_steps=args.grad_accum,
         lr=args.lr,
         max_examples=args.max_examples,
+        seed=args.seed,
     )
 
 

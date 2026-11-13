@@ -12,10 +12,17 @@ from tokenisers import WpBpePpigTokenizer
 from torch.utils.data import DataLoader
 
 from crouton.config import CroutonConfig, TrainConfig
-from crouton.data import StreamingPackedDataset, resolve_token_id
+from crouton.data import StreamingPackedDataset
 from crouton.model import CroutonForCausalLM
 from crouton.optim import build_optimizers, set_optimizer_lr, wsd_lr_multiplier
-from crouton.train.common import get_device, next_or_restart, save_checkpoint, unwrap_model, validate_tokenizer_vocab
+from crouton.train.common import (
+    bf16_supported,
+    evaluate_model_bpb,
+    get_device,
+    next_or_restart,
+    save_checkpoint,
+    validate_tokenizer_vocab,
+)
 
 
 @torch.no_grad()
@@ -27,37 +34,8 @@ def run_validation_bpb(
     device: torch.device,
     amp_ctx,
 ) -> tuple[float, float]:
-    raw_model = unwrap_model(model)
-    was_training = raw_model.training
-    raw_model.eval()
-    eos_id = resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
-    total_nll = 0.0
-    total_tokens = 0
-    total_bytes = 0
-
-    for text in val_texts:
-        doc_ids = tokenizer.encode(text)
-        if not doc_ids:
-            continue
-        ids = [eos_id] + doc_ids
-        for start in range(0, len(ids) - 1, seq_len):
-            chunk = ids[start : start + seq_len + 1]
-            if len(chunk) < 2:
-                continue
-            x = torch.tensor([chunk[:-1]], dtype=torch.long, device=device)
-            y = torch.tensor([chunk[1:]], dtype=torch.long, device=device)
-            with amp_ctx:
-                out = raw_model(x, targets=y)
-            n_tok = y.numel()
-            total_nll += float(out.loss.item()) * n_tok
-            total_tokens += n_tok
-        total_bytes += len(text.encode("utf-8"))
-
-    if was_training:
-        raw_model.train()
-    avg_loss = total_nll / max(1, total_tokens)
-    bpb = (total_nll / math.log(2.0)) / max(1, total_bytes)
-    return avg_loss, bpb
+    metrics = evaluate_model_bpb(model, tokenizer, val_texts, seq_len, device, amp_ctx)
+    return metrics["loss_nats"], metrics["bpb"]
 
 
 def run_pretrain(
@@ -66,9 +44,11 @@ def run_pretrain(
     local_file: str | None = None,
     val_file: str | None = None,
 ) -> None:
+    if train_cfg.seq_len < 1 or train_cfg.total_steps < 1 or train_cfg.micro_batch_size < 1 or train_cfg.grad_accum_steps < 1:
+        raise ValueError("seq_len, total_steps, micro_batch_size, and grad_accum_steps must all be >= 1")
     torch.manual_seed(train_cfg.seed)
     device = get_device()
-    use_bf16 = train_cfg.bf16 and device.type == "cuda"
+    use_bf16 = train_cfg.bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     tokenizer = WpBpePpigTokenizer.from_pretrained(train_cfg.tokenizer_path)
@@ -148,7 +128,7 @@ def run_pretrain(
             )
             print(f"[pretrain val step {step:6d}] val_loss={val_loss:.4f} val_bpb={val_bpb:.4f}")
 
-        if step > 0 and step % train_cfg.save_interval == 0:
+        if train_cfg.save_interval > 0 and step > 0 and step % train_cfg.save_interval == 0:
             save_checkpoint(Path(train_cfg.output_dir) / f"step_{step}.pt", model, model_cfg, step)
 
     save_checkpoint(Path(train_cfg.output_dir) / "final.pt", model, model_cfg, train_cfg.total_steps)
@@ -173,6 +153,7 @@ def main() -> None:
     parser.add_argument("--save-interval", type=int, default=1000)
     parser.add_argument("--local-file", type=str, default=None)
     parser.add_argument("--val-file", type=str, default=None)
+    parser.add_argument("--no-bf16", action="store_true")
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
 
@@ -180,12 +161,15 @@ def main() -> None:
     if args.vocab_size is not None:
         model_cfg.vocab_size = args.vocab_size
     if args.seq_len is not None:
+        if args.seq_len < 1:
+            raise ValueError(f"--seq-len ({args.seq_len}) must be >= 1")
         model_cfg.max_seq_len = args.seq_len
         model_cfg.rope_original_max_seq_len = args.seq_len
+    model_cfg.__post_init__()
     train_cfg = TrainConfig(
         output_dir=args.output_dir,
         tokenizer_path=args.tokenizer,
-        seq_len=args.seq_len or model_cfg.max_seq_len,
+        seq_len=args.seq_len if args.seq_len is not None else model_cfg.max_seq_len,
         micro_batch_size=args.micro_batch,
         grad_accum_steps=args.grad_accum,
         total_steps=args.steps,
@@ -193,6 +177,7 @@ def main() -> None:
         decay_steps=args.decay_steps,
         muon_lr=args.muon_lr,
         adamw_lr=args.adamw_lr,
+        bf16=not args.no_bf16,
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         compile_model=not args.no_compile,
