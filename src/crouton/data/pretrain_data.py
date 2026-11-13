@@ -75,13 +75,27 @@ class StreamingPackedDataset(IterableDataset):
 
         from datasets import load_dataset
 
-        epoch_offset = self._iter_epoch * max(1, len(self.sources))
+        epoch_offset = (
+            ((int(worker.seed) - worker_id) % (2**31 - 1))
+            if worker is not None
+            else self._iter_epoch
+        ) * max(1, len(self.sources))
         self._iter_epoch += 1
         iters = []
+        sharded_flags = []
         for idx, (name, subset, split, _) in enumerate(self.sources):
             ds = load_dataset(name, subset, split=split, streaming=True)
+            sharded = False
+            if num_workers > 1 and getattr(ds, "n_shards", 1) >= num_workers:
+                ds = ds.shard(num_shards=num_workers, index=worker_id)
+                sharded = True
             if self.shuffle_seed is not None:
-                ds = ds.shuffle(seed=self.shuffle_seed + epoch_offset + idx, buffer_size=self.shuffle_buffer)
+                worker_mix = worker_id if sharded else 0
+                ds = ds.shuffle(
+                    seed=self.shuffle_seed + epoch_offset + idx + worker_mix,
+                    buffer_size=self.shuffle_buffer,
+                )
+            sharded_flags.append(sharded)
             iters.append(iter(ds))
         fields = [field for _, _, _, field in self.sources]
         exhausted: set[int] = set()
@@ -100,9 +114,10 @@ class StreamingPackedDataset(IterableDataset):
                 continue
             text = row.get(fields[stream_i], "")
             if isinstance(text, str) and text.strip():
-                if doc_idx % num_workers == worker_id:
+                if sharded_flags[stream_i] or doc_idx % num_workers == worker_id:
                     yield text
-                doc_idx += 1
+                if not sharded_flags[stream_i]:
+                    doc_idx += 1
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         buf: list[int] = []

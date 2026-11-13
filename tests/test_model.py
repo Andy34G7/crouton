@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from crouton.config import CroutonConfig
+from crouton.config import CroutonConfig, TrainConfig
 from crouton.model import CroutonForCausalLM, HybridSparseAttention, build_swa_sink_mask
 from crouton.model.rope import apply_rope
 
@@ -200,3 +200,31 @@ def test_model_config_validation_and_optional_flags(tmp_path):
     assert gen.shape == (2, 7)
     assert (gen[:, 3:] < 64).all()
     assert model.training
+
+    # Right-padded attention_mask must match unpadded valid-prefix logits without 4D mask divergence,
+    # while left-padded attention_mask still isolates leading padded keys.
+    model.eval()
+    prefix = torch.tensor([[5, 9, 12]], dtype=torch.long)
+    pad_a = torch.tensor([[5, 9, 12, 0, 1]], dtype=torch.long)
+    pad_b = torch.tensor([[5, 9, 12, 42, 99]], dtype=torch.long)
+    right_mask = torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.bool)
+    with torch.no_grad():
+        logits_ref = model(prefix).logits
+        logits_a = model(pad_a, attention_mask=right_mask).logits[:, :3]
+        logits_b = model(pad_b, attention_mask=right_mask).logits[:, :3]
+    assert torch.allclose(logits_a, logits_ref, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(logits_a, logits_b, atol=1e-6)
+
+    left_a = torch.tensor([[7, 8, 5, 9, 12]], dtype=torch.long)
+    left_b = torch.tensor([[99, 77, 5, 9, 12]], dtype=torch.long)
+    left_mask = torch.tensor([[0, 0, 1, 1, 1]], dtype=torch.bool)
+    with torch.no_grad():
+        left_out_a = model(left_a, attention_mask=left_mask).logits[:, 2:]
+        left_out_b = model(left_b, attention_mask=left_mask).logits[:, 2:]
+    assert torch.allclose(left_out_a, left_out_b, atol=1e-6)
+
+    for bad_float in ({"rope_theta": float("nan")}, {"norm_eps": float("inf")}, {"router_jitter": float("nan")}):
+        with pytest.raises(ValueError):
+            CroutonConfig(**bad_float)
+    with pytest.raises(ValueError):
+        TrainConfig(muon_lr=float("nan"))

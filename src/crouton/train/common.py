@@ -103,7 +103,7 @@ def evaluate_model_bpb(
         stride = max(1, seq_len // 2)
 
         for text in texts:
-            doc_ids = tokenizer.encode(text)
+            doc_ids = tokenizer.encode(text, split_special_tokens=True)
             if not doc_ids:
                 continue
             ids = [eos_id] + doc_ids
@@ -165,14 +165,14 @@ def save_checkpoint(
     torch.save(payload, out)
 
 
-def load_checkpoint(
+def load_checkpoint_payload(
     path: str | Path,
-    device: torch.device,
     override_seq_len: int | None = None,
     override_rope_scale: float | None = None,
     override_rope_scaling_type: str | None = None,
-) -> tuple[CroutonForCausalLM, CroutonConfig, int]:
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+) -> tuple[dict[str, Any], CroutonConfig, int]:
+    """Load checkpoint payload and validated CroutonConfig on CPU before GPU/network setup."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg_dict = dict(ckpt["config"])
     if "rope_original_max_seq_len" not in cfg_dict:
         cfg_dict["rope_original_max_seq_len"] = cfg_dict.get("max_seq_len", 2048)
@@ -182,9 +182,33 @@ def load_checkpoint(
         cfg_dict["rope_scale_factor"] = override_rope_scale
     if override_rope_scaling_type is not None:
         cfg_dict["rope_scaling_type"] = override_rope_scaling_type
-
     cfg = CroutonConfig(**cfg_dict)
+    return ckpt, cfg, int(ckpt.get("step", 0))
+
+
+def instantiate_checkpoint_model(
+    ckpt: dict[str, Any],
+    cfg: CroutonConfig,
+    device: torch.device,
+) -> CroutonForCausalLM:
+    """Build CroutonForCausalLM on `device` from an already-loaded checkpoint payload."""
     model = CroutonForCausalLM(cfg).to(device)
     state_dict = strip_orig_mod_prefix(ckpt["model"])
     model.load_state_dict(state_dict, strict=True)
-    return model, cfg, int(ckpt.get("step", 0))
+    return model
+
+
+def load_checkpoint(
+    path: str | Path,
+    device: torch.device,
+    override_seq_len: int | None = None,
+    override_rope_scale: float | None = None,
+    override_rope_scaling_type: str | None = None,
+) -> tuple[CroutonForCausalLM, CroutonConfig, int]:
+    ckpt, cfg, step = load_checkpoint_payload(
+        path,
+        override_seq_len=override_seq_len,
+        override_rope_scale=override_rope_scale,
+        override_rope_scaling_type=override_rope_scaling_type,
+    )
+    return instantiate_checkpoint_model(ckpt, cfg, device), cfg, step

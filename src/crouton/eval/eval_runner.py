@@ -241,6 +241,7 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
             else:
                 short_items.append((idx, ctx_ids, cont_ids))
 
+        short_items.sort(key=lambda item: len(item[1]) + len(item[2]))
         for start in range(0, len(short_items), self.batch_size):
             chunk = short_items[start : start + self.batch_size]
             scores = self._score_batch([(c_ids, t_ids) for _, c_ids, t_ids in chunk])
@@ -392,17 +393,19 @@ def main() -> None:
     if args.batch_size < 1 or (args.limit is not None and args.limit < 1) or (args.seq_len is not None and args.seq_len < 1):
         parser.error("--batch-size, --limit, and --seq-len must all be >= 1")
 
-    texts: list[str] | None = None
-    if args.val_file:
-        texts = [line.strip() for line in Path(args.val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not texts:
-            raise ValueError(f"Validation file {args.val_file!r} contains no non-empty lines")
-
     task_list: list[str] = []
     if args.tasks is not None:
         task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
         if not task_list:
             parser.error("--tasks must contain at least one non-empty task name")
+        if not HAS_LM_EVAL:
+            raise RuntimeError("lm-eval is not installed. Install with: uv sync --extra dev --extra eval")
+
+    texts: list[str] | None = None
+    if args.val_file:
+        texts = [line.strip() for line in Path(args.val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not texts:
+            raise ValueError(f"Validation file {args.val_file!r} contains no non-empty lines")
 
     use_bf16 = not args.no_bf16
     report: dict[str, Any] = {"primary": {}}

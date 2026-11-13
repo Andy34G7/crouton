@@ -265,9 +265,12 @@ def test_end_to_end_pipeline_and_eval_smoke(tmp_path, monkeypatch):
         output_dir=str(sft_dir),
         seq_len=32,
         total_steps=1,
-        micro_batch_size=1,
+        micro_batch_size=2,
         grad_accum_steps=1,
-        examples_override=[[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"}]] * 2,
+        examples_override=[
+            [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"}],
+            [{"role": "user", "content": "Explain Dense MoE briefly."}, {"role": "assistant", "content": "Dense MoE with ReLU^2!"}],
+        ],
     )
     sft_ckpt = sft_dir / "final.pt"
     assert sft_ckpt.exists()
@@ -583,9 +586,88 @@ def test_utils_and_cli_edge_cases(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["crouton-eval", "--checkpoint", ckpt_file, "--tasks", ",,,"])
     with pytest.raises(SystemExit):
         eval_mod.main()
+    monkeypatch.setattr(eval_mod, "HAS_LM_EVAL", False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-eval", "--checkpoint", str(tmp_path / "nonexistent.pt"), "--val-file", str(tmp_path / "nonexistent.txt"), "--tasks", "hellaswag"],
+    )
+    with pytest.raises(RuntimeError, match="lm-eval"):
+        eval_mod.main()
+
     monkeypatch.setattr(sys, "argv", ["crouton-dpo", "--base-checkpoint", ckpt_file, "--beta", "0"])
-    with pytest.raises(ValueError, match="beta"):
+    with pytest.raises(SystemExit):
         dpo_mod.main()
+    monkeypatch.setattr(sys, "argv", ["crouton-dpo", "--base-checkpoint", ckpt_file, "--dataset", ""])
+    with pytest.raises(SystemExit):
+        dpo_mod.main()
+    with pytest.raises(ValueError, match="beta"):
+        run_preference_tuning(ckpt_file, str(tok_path), str(tmp_path / "bad_beta"), beta=0.0, pairs_override=[])
+
     monkeypatch.setattr(sys, "argv", ["crouton-grpo", "--base-checkpoint", ckpt_file, "--temperature", "0"])
     with pytest.raises(SystemExit):
         grpo_mod.main()
+    monkeypatch.setattr(sys, "argv", ["crouton-grpo", "--base-checkpoint", ckpt_file, "--kl-beta", "nan"])
+    with pytest.raises(SystemExit):
+        grpo_mod.main()
+    monkeypatch.setattr(grpo_mod, "load_gsm8k_tasks", lambda **kw: (_ for _ in ()).throw(AssertionError("should fail before GSM8K")))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-grpo", "--base-checkpoint", str(mid_out / "final.pt"), "--tokenizer", str(tok_path), "--max-new-tokens", "99999"],
+    )
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        grpo_mod.main()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-pretrain", "--model-config", str(tmp_path / "missing.yaml"), "--seq-len", "0"],
+    )
+    with pytest.raises(SystemExit):
+        pretrain_mod.main()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-tokenizer", "--vocab-size", "259", "--dataset", "x"],
+    )
+    with pytest.raises(SystemExit):
+        tok_mod.main()
+    monkeypatch.setattr(sys, "argv", ["crouton-tokenizer", "--dataset", "  "])
+    with pytest.raises(SystemExit):
+        tok_mod.main()
+    monkeypatch.setattr(sys, "argv", ["crouton-mid", "--base-checkpoint", ckpt_file, "--subset", "none"])
+    with pytest.raises(SystemExit):
+        mid_mod.main()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-mid", "--base-checkpoint", ckpt_file, "--local-file", str(data_file), "--dataset", "x"],
+    )
+    with pytest.raises(SystemExit):
+        mid_mod.main()
+    monkeypatch.setattr(sys, "argv", ["crouton-sft", "--base-checkpoint", ckpt_file, "--dataset", ""])
+    with pytest.raises(SystemExit):
+        sft_mod.main()
+
+    # GRPO deterministic routing with router_jitter > 0 and vocab_limit normalization parity
+    jit_cfg = _tiny_cfg()
+    jit_cfg.vocab_size = tok.vocab_size + 16
+    jit_cfg.router_jitter = 0.25
+    jit_ckpt = tmp_path / "jit.pt"
+    save_checkpoint(jit_ckpt, CroutonForCausalLM(jit_cfg), jit_cfg, step=1)
+    run_grpo(
+        base_checkpoint=str(jit_ckpt),
+        tokenizer_path=str(tok_path),
+        output_dir=str(tmp_path / "jit_grpo"),
+        prompts_with_verifiers=build_builtin_math_tasks(n=2),
+        group_size=2,
+        steps=1,
+        max_new_tokens=4,
+    )
+    assert (tmp_path / "jit_grpo" / "final.pt").exists()
+
+    # BPB validation matches StreamingPackedDataset split_special_tokens=True on literal special-token text
+    lit = "Dense <|im_end|> MoE <|endoftext|> test."
+    bpb_lit = evaluate_bpb(ckpt_file, str(tok_path), [lit], seq_len=32, bf16=False)
+    assert int(bpb_lit["tokens"]) == len(tok.encode(lit, split_special_tokens=True))

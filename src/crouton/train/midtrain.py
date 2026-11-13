@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import math
 from pathlib import Path
 
 import torch
@@ -15,11 +16,53 @@ from crouton.optim import build_optimizers, set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import (
     bf16_supported,
     get_device,
-    load_checkpoint,
+    instantiate_checkpoint_model,
+    load_checkpoint_payload,
     next_or_restart,
     save_checkpoint,
     validate_tokenizer_vocab,
 )
+
+
+def _validate_midtrain_args(
+    seq_len: int,
+    total_steps: int,
+    micro_batch_size: int,
+    grad_accum_steps: int,
+    warmup_steps: int,
+    save_interval: int,
+    muon_lr: float,
+    adamw_lr: float,
+    rope_scale_factor: float,
+    dataset_name: str | None,
+    subset: str | None,
+    split: str,
+    text_field: str,
+    local_file: str | None,
+) -> None:
+    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1:
+        raise ValueError("seq_len, total_steps, micro_batch_size, and grad_accum_steps must all be >= 1")
+    if (
+        warmup_steps < 0
+        or save_interval < 0
+        or not math.isfinite(muon_lr)
+        or muon_lr <= 0.0
+        or not math.isfinite(adamw_lr)
+        or adamw_lr <= 0.0
+        or not math.isfinite(rope_scale_factor)
+        or rope_scale_factor <= 0.0
+    ):
+        raise ValueError(
+            "warmup_steps and save_interval must be >= 0; muon_lr, adamw_lr, and rope_scale_factor must be finite > 0"
+        )
+    if dataset_name is not None and (not isinstance(dataset_name, str) or not dataset_name.strip()):
+        raise ValueError("dataset_name must be non-empty when specified")
+    if not isinstance(split, str) or not split.strip() or not isinstance(text_field, str) or not text_field.strip():
+        raise ValueError("split and text_field must be non-empty")
+    if subset is not None and not dataset_name:
+        raise ValueError("subset requires dataset_name to be set")
+    if local_file is not None and (dataset_name is not None or subset is not None):
+        raise ValueError("local_file cannot be combined with dataset_name or subset")
 
 
 def run_midtrain(
@@ -44,12 +87,22 @@ def run_midtrain(
     save_interval: int = 0,
     seed: int = 42,
 ) -> None:
-    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1:
-        raise ValueError("seq_len, total_steps, micro_batch_size, and grad_accum_steps must all be >= 1")
-    if warmup_steps < 0 or save_interval < 0 or muon_lr <= 0.0 or adamw_lr <= 0.0 or rope_scale_factor <= 0.0:
-        raise ValueError("warmup_steps and save_interval must be >= 0; muon_lr, adamw_lr, and rope_scale_factor must be > 0")
-    if subset is not None and not dataset_name:
-        raise ValueError("subset requires dataset_name to be set")
+    _validate_midtrain_args(
+        seq_len=seq_len,
+        total_steps=total_steps,
+        micro_batch_size=micro_batch_size,
+        grad_accum_steps=grad_accum_steps,
+        warmup_steps=warmup_steps,
+        save_interval=save_interval,
+        muon_lr=muon_lr,
+        adamw_lr=adamw_lr,
+        rope_scale_factor=rope_scale_factor,
+        dataset_name=dataset_name,
+        subset=subset,
+        split=split,
+        text_field=text_field,
+        local_file=local_file,
+    )
 
     local_texts = None
     if local_file is not None:
@@ -62,15 +115,15 @@ def run_midtrain(
     use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    model, model_cfg, _ = load_checkpoint(
+    ckpt, model_cfg, _ = load_checkpoint_payload(
         base_checkpoint,
-        device=device,
         override_seq_len=seq_len,
         override_rope_scale=rope_scale_factor,
         override_rope_scaling_type=rope_scaling_type,
     )
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
+    model = instantiate_checkpoint_model(ckpt, model_cfg, device)
 
     sources = (
         [(dataset_name, subset, split, text_field)]
@@ -152,6 +205,31 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    if args.local_file is not None and (
+        args.dataset is not None or args.subset is not None or args.split != "train" or args.text_field != "text"
+    ):
+        parser.error("--local-file cannot be combined with --dataset, --subset, --split, or --text-field")
+    try:
+        _validate_midtrain_args(
+            seq_len=args.seq_len,
+            total_steps=args.steps,
+            micro_batch_size=args.micro_batch,
+            grad_accum_steps=args.grad_accum,
+            warmup_steps=args.warmup_steps,
+            save_interval=args.save_interval,
+            muon_lr=args.muon_lr,
+            adamw_lr=args.adamw_lr,
+            rope_scale_factor=args.rope_scale,
+            dataset_name=args.dataset,
+            subset=args.subset,
+            split=args.split,
+            text_field=args.text_field,
+            local_file=args.local_file,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    dataset_name = args.dataset.strip() if args.dataset is not None else None
     subset = None if args.subset in (None, "none", "None", "") else args.subset
     run_midtrain(
         base_checkpoint=args.base_checkpoint,
@@ -166,7 +244,7 @@ def main() -> None:
         grad_accum_steps=args.grad_accum,
         muon_lr=args.muon_lr,
         adamw_lr=args.adamw_lr,
-        dataset_name=args.dataset,
+        dataset_name=dataset_name,
         subset=subset,
         split=args.split,
         text_field=args.text_field,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from functools import partial
+import math
 from pathlib import Path
 
 import torch
@@ -12,12 +14,13 @@ from tokenisers import WpBpePpigTokenizer
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from crouton.data import SFTDataset
+from crouton.data import SFTDataset, collate_sft_batch, is_chatml_messages
 from crouton.optim import build_adamw_param_groups, set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import (
     bf16_supported,
     get_device,
-    load_checkpoint,
+    instantiate_checkpoint_model,
+    load_checkpoint_payload,
     next_or_restart,
     save_checkpoint,
     validate_tokenizer_vocab,
@@ -27,6 +30,25 @@ SFT_PRESETS: dict[str, tuple[str, str | None]] = {
     "smoltalk": ("HuggingFaceTB/smoltalk", "all"),
     "tulu3": ("allenai/tulu-3-sft-mixture", None),
 }
+
+
+def _validate_sft_args(
+    seq_len: int,
+    total_steps: int,
+    micro_batch_size: int,
+    grad_accum_steps: int,
+    max_examples: int,
+    lr: float,
+    save_interval: int,
+    dataset_name: str,
+    require_dataset: bool = True,
+) -> None:
+    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1 or max_examples < 1:
+        raise ValueError("seq_len, total_steps, micro_batch_size, grad_accum_steps, and max_examples must all be >= 1")
+    if not math.isfinite(lr) or lr <= 0.0 or save_interval < 0:
+        raise ValueError("lr must be finite > 0 and save_interval must be >= 0")
+    if require_dataset and (not isinstance(dataset_name, str) or not dataset_name.strip()):
+        raise ValueError("dataset_name must be non-empty")
 
 
 def run_sft(
@@ -46,18 +68,24 @@ def run_sft(
     save_interval: int = 0,
     seed: int = 42,
 ) -> None:
-    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1 or max_examples < 1:
-        raise ValueError("seq_len, total_steps, micro_batch_size, grad_accum_steps, and max_examples must all be >= 1")
-    if lr <= 0.0 or save_interval < 0:
-        raise ValueError("lr must be > 0 and save_interval must be >= 0")
+    _validate_sft_args(
+        seq_len=seq_len,
+        total_steps=total_steps,
+        micro_batch_size=micro_batch_size,
+        grad_accum_steps=grad_accum_steps,
+        max_examples=max_examples,
+        lr=lr,
+        save_interval=save_interval,
+        dataset_name=dataset_name,
+        require_dataset=examples_override is None,
+    )
     torch.manual_seed(seed)
     device = get_device()
     use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    model, model_cfg, _ = load_checkpoint(
+    ckpt, model_cfg, _ = load_checkpoint_payload(
         base_checkpoint,
-        device=device,
         override_seq_len=seq_len,
     )
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
@@ -66,11 +94,11 @@ def run_sft(
     if examples_override is not None:
         examples = examples_override
     else:
-        raw = load_dataset(dataset_name, subset, split="train", streaming=True)
+        raw = load_dataset(dataset_name.strip(), subset, split="train", streaming=True)
         examples = []
         for row in raw:
             msgs = row.get("messages")
-            if isinstance(msgs, list) and msgs:
+            if is_chatml_messages(msgs):
                 examples.append(msgs)
                 if len(examples) >= max_examples:
                     break
@@ -78,8 +106,14 @@ def run_sft(
     if not examples:
         raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
 
-    ds = SFTDataset(examples, tokenizer=tokenizer, seq_len=seq_len)
-    loader = DataLoader(ds, batch_size=micro_batch_size, shuffle=True)
+    model = instantiate_checkpoint_model(ckpt, model_cfg, device)
+    ds = SFTDataset(examples, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
+    loader = DataLoader(
+        ds,
+        batch_size=micro_batch_size,
+        shuffle=True,
+        collate_fn=partial(collate_sft_batch, pad_id=ds.pad_id),
+    )
     it = iter(loader)
 
     opt = AdamW(build_adamw_param_groups(model, weight_decay=0.01), lr=lr, betas=(0.9, 0.95))
@@ -150,9 +184,25 @@ def main() -> None:
         dataset_name, preset_sub = SFT_PRESETS[args.preset]
         subset = preset_sub if args.subset is None else (None if args.subset in ("none", "None", "") else args.subset)
     else:
-        dataset_name = args.dataset or "HuggingFaceTB/smoltalk"
+        if args.dataset is not None and not args.dataset.strip():
+            parser.error("--dataset must be a non-empty dataset name")
+        dataset_name = args.dataset.strip() if args.dataset is not None else "HuggingFaceTB/smoltalk"
         raw_sub = None if args.subset in (None, "none", "None", "") else args.subset
         subset = "all" if (dataset_name == "HuggingFaceTB/smoltalk" and args.subset is None) else raw_sub
+
+    try:
+        _validate_sft_args(
+            seq_len=args.seq_len,
+            total_steps=args.steps,
+            micro_batch_size=args.micro_batch,
+            grad_accum_steps=args.grad_accum,
+            max_examples=args.max_examples,
+            lr=args.lr,
+            save_interval=args.save_interval,
+            dataset_name=dataset_name,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     run_sft(
         base_checkpoint=args.base_checkpoint,

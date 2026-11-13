@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from tokenisers import WpBpePpigTokenizer
@@ -14,6 +15,7 @@ DEFAULT_TOKENIZER_SOURCES = [
     ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
     ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
 ]
+MIN_VOCAB_SIZE = 256 + sum(len(t.encode("utf-8")) > 1 for t in DEFAULT_SPECIAL_TOKENS)
 
 
 def iter_hf_corpus(
@@ -48,8 +50,7 @@ def iter_hf_corpus(
 
 def read_local_corpus(path: str | Path) -> list[str]:
     text = Path(path).read_text(encoding="utf-8")
-    lines = [line for line in text.splitlines() if line.strip()]
-    return lines if lines else ([text] if text else [])
+    return [line for line in text.splitlines() if line.strip()]
 
 
 def train_crouton_tokenizer(
@@ -61,8 +62,15 @@ def train_crouton_tokenizer(
     individual_digits: bool = True,
 ) -> WpBpePpigTokenizer:
     """Train WpBpePpigTokenizer with crouton pretokenizer and export to `output_path`."""
-    if vocab_size < 1 or min_frequency < 1 or length_penalty < 0.0:
-        raise ValueError("vocab_size must be >= 1, min_frequency >= 1, and length_penalty >= 0")
+    if (
+        vocab_size < MIN_VOCAB_SIZE
+        or min_frequency < 1
+        or not math.isfinite(length_penalty)
+        or length_penalty < 0.0
+    ):
+        raise ValueError(
+            f"vocab_size must be >= {MIN_VOCAB_SIZE}, min_frequency >= 1, and length_penalty finite >= 0"
+        )
     if isinstance(corpus, str):
         corpus = [line for line in corpus.splitlines() if line.strip()] or ([corpus] if corpus.strip() else [])
     else:
@@ -103,21 +111,33 @@ def main() -> None:
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--max-docs", type=int, default=50000)
     args = parser.parse_args()
-    if args.vocab_size < 1 or args.min_frequency < 1 or args.length_penalty < 0.0 or args.max_docs < 1:
-        parser.error("--vocab-size, --min-frequency, and --max-docs must be >= 1, and --length-penalty >= 0")
-    if args.local_file and (args.dataset or args.subset is not None):
+    if (
+        args.vocab_size < MIN_VOCAB_SIZE
+        or args.min_frequency < 1
+        or not math.isfinite(args.length_penalty)
+        or args.length_penalty < 0.0
+        or args.max_docs < 1
+    ):
+        parser.error(
+            f"--vocab-size must be >= {MIN_VOCAB_SIZE}, --min-frequency and --max-docs >= 1, and --length-penalty finite >= 0"
+        )
+    if args.dataset is not None and not args.dataset.strip():
+        parser.error("--dataset must be a non-empty dataset name")
+    if not args.split.strip() or not args.text_field.strip():
+        parser.error("--split and --text-field must be non-empty")
+    if args.local_file and (args.dataset is not None or args.subset is not None):
         parser.error("--local-file cannot be combined with --dataset or --subset")
-    if args.subset is not None and not args.dataset:
+    if args.subset is not None and args.dataset is None:
         parser.error("--subset requires --dataset")
 
     if args.local_file:
         corpus = read_local_corpus(args.local_file)
         if not corpus or not any(line.strip() for line in corpus):
             raise ValueError(f"Local tokenizer corpus {args.local_file!r} contains no non-empty text")
-    elif args.dataset:
+    elif args.dataset is not None:
         subset = None if args.subset in (None, "none", "None", "") else args.subset
         corpus = iter_hf_corpus(
-            sources=[(args.dataset, subset, args.split, args.text_field)],
+            sources=[(args.dataset.strip(), subset, args.split.strip(), args.text_field.strip())],
             max_docs=args.max_docs,
         )
     else:

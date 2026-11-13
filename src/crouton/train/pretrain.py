@@ -161,32 +161,44 @@ def main() -> None:
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
 
+    if args.vocab_size is not None and args.vocab_size < 1:
+        parser.error("--vocab-size must be >= 1")
+    if args.seq_len is not None and args.seq_len < 1:
+        parser.error("--seq-len must be >= 1")
+    try:
+        train_cfg = TrainConfig(
+            output_dir=args.output_dir,
+            tokenizer_path=args.tokenizer,
+            seq_len=args.seq_len if args.seq_len is not None else 1,
+            micro_batch_size=args.micro_batch,
+            grad_accum_steps=args.grad_accum,
+            total_steps=args.steps,
+            warmup_steps=args.warmup_steps,
+            decay_steps=args.decay_steps,
+            muon_lr=args.muon_lr,
+            adamw_lr=args.adamw_lr,
+            bf16=not args.no_bf16,
+            eval_interval=args.eval_interval,
+            save_interval=args.save_interval,
+            compile_model=not args.no_compile,
+            seed=args.seed,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    for label, fpath in (("Local training", args.local_file), ("Validation", args.val_file)):
+        if fpath is not None and not [line for line in Path(fpath).read_text(encoding="utf-8").splitlines() if line.strip()]:
+            raise ValueError(f"{label} file {fpath!r} contains no non-empty lines")
+
     model_cfg = CroutonConfig.from_yaml(args.model_config)
     if args.vocab_size is not None:
         model_cfg.vocab_size = args.vocab_size
     if args.seq_len is not None:
-        if args.seq_len < 1:
-            raise ValueError(f"--seq-len ({args.seq_len}) must be >= 1")
         model_cfg.max_seq_len = args.seq_len
         model_cfg.rope_original_max_seq_len = args.seq_len
     model_cfg.__post_init__()
-    train_cfg = TrainConfig(
-        output_dir=args.output_dir,
-        tokenizer_path=args.tokenizer,
-        seq_len=args.seq_len if args.seq_len is not None else model_cfg.max_seq_len,
-        micro_batch_size=args.micro_batch,
-        grad_accum_steps=args.grad_accum,
-        total_steps=args.steps,
-        warmup_steps=args.warmup_steps,
-        decay_steps=args.decay_steps,
-        muon_lr=args.muon_lr,
-        adamw_lr=args.adamw_lr,
-        bf16=not args.no_bf16,
-        eval_interval=args.eval_interval,
-        save_interval=args.save_interval,
-        compile_model=not args.no_compile,
-        seed=args.seed,
-    )
+    if args.seq_len is None:
+        train_cfg.seq_len = model_cfg.max_seq_len
     run_pretrain(model_cfg, train_cfg, local_file=args.local_file, val_file=args.val_file)
 
 

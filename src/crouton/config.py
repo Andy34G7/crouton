@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -57,14 +58,27 @@ class CroutonConfig:
             raise ValueError("global_layer_interval must be >= 1")
         if self.sliding_window < 1 or self.sink_tokens < 0:
             raise ValueError("sliding_window must be >= 1 and sink_tokens >= 0")
-        if self.expert_rank < 1 or self.n_experts < 1 or self.expert_alpha <= 0.0:
+        if self.expert_rank < 1 or self.n_experts < 1 or not math.isfinite(self.expert_alpha) or self.expert_alpha <= 0.0:
             raise ValueError("expert_rank and n_experts must be >= 1 and expert_alpha must be > 0")
-        if self.norm_eps <= 0.0 or self.logit_softcap < 0.0 or self.router_jitter < 0.0:
-            raise ValueError("norm_eps must be > 0 and logit_softcap / router_jitter must be >= 0")
+        if (
+            not math.isfinite(self.norm_eps)
+            or self.norm_eps <= 0.0
+            or not math.isfinite(self.logit_softcap)
+            or self.logit_softcap < 0.0
+            or not math.isfinite(self.router_jitter)
+            or self.router_jitter < 0.0
+        ):
+            raise ValueError("norm_eps must be > 0 and logit_softcap / router_jitter must be finite >= 0")
         if self.max_seq_len < 1:
             raise ValueError(f"max_seq_len ({self.max_seq_len}) must be >= 1")
-        if self.rope_theta <= 1.0 or self.rope_scale_factor <= 0.0 or self.rope_original_max_seq_len < 1:
-            raise ValueError("rope_theta must be > 1, rope_scale_factor > 0, and rope_original_max_seq_len >= 1")
+        if (
+            not math.isfinite(self.rope_theta)
+            or self.rope_theta <= 1.0
+            or not math.isfinite(self.rope_scale_factor)
+            or self.rope_scale_factor <= 0.0
+            or self.rope_original_max_seq_len < 1
+        ):
+            raise ValueError("rope_theta must be finite > 1, rope_scale_factor finite > 0, and rope_original_max_seq_len >= 1")
         if self.rope_scaling_type not in ("yarn", "ntk"):
             raise ValueError(f"Unsupported rope_scaling_type: {self.rope_scaling_type!r}")
 
@@ -132,7 +146,19 @@ class TrainConfig:
             )
         if self.warmup_steps < 0 or self.decay_steps < 0 or self.eval_interval < 0 or self.save_interval < 0:
             raise ValueError("warmup_steps, decay_steps, eval_interval, and save_interval must be >= 0")
-        if self.muon_lr <= 0.0 or self.adamw_lr <= 0.0 or not (0.0 <= self.min_lr_ratio <= 1.0):
-            raise ValueError("muon_lr and adamw_lr must be > 0 and min_lr_ratio must be in [0, 1]")
-        if self.weight_decay < 0.0 or self.grad_clip <= 0.0:
-            raise ValueError("weight_decay must be >= 0 and grad_clip must be > 0")
+        if (
+            not math.isfinite(self.muon_lr)
+            or self.muon_lr <= 0.0
+            or not math.isfinite(self.adamw_lr)
+            or self.adamw_lr <= 0.0
+            or not math.isfinite(self.min_lr_ratio)
+            or not (0.0 <= self.min_lr_ratio <= 1.0)
+        ):
+            raise ValueError("muon_lr and adamw_lr must be finite > 0 and min_lr_ratio must be in [0, 1]")
+        if (
+            not math.isfinite(self.weight_decay)
+            or self.weight_decay < 0.0
+            or not math.isfinite(self.grad_clip)
+            or self.grad_clip <= 0.0
+        ):
+            raise ValueError("weight_decay must be finite >= 0 and grad_clip must be finite > 0")

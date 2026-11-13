@@ -54,6 +54,14 @@ def build_swa_sink_mask(
     return mask.unsqueeze(0).unsqueeze(0)
 
 
+def _is_right_padded(attention_mask: torch.Tensor) -> bool:
+    """Return True when every row has False/0 only in a trailing suffix (or no padding)."""
+    m = attention_mask.bool()
+    if m.size(1) <= 1:
+        return True
+    return not bool((m[:, 1:] & ~m[:, :-1]).any().item())
+
+
 def build_padded_attn_mask(
     attention_mask: torch.Tensor,
     seq_len: int,
@@ -61,7 +69,7 @@ def build_padded_attn_mask(
     sliding_window: int,
     sink_tokens: int,
 ) -> torch.Tensor:
-    """Build [B, 1, T, T] boolean causal/SWA mask for right-padded inputs without NaN rows."""
+    """Build [B, 1, T, T] boolean causal/SWA mask without NaN rows."""
     key_keep = attention_mask[:, None, None, :].bool()
     if is_global:
         base_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=attention_mask.device))
@@ -176,7 +184,7 @@ class HybridSparseAttention(nn.Module):
         if precomputed_mask is not None:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=precomputed_mask, enable_gqa=self.n_rep > 1)
         else:
-            if attention_mask is not None and not torch.compiler.is_compiling() and bool(attention_mask.all().item()):
+            if attention_mask is not None and not torch.compiler.is_compiling() and _is_right_padded(attention_mask):
                 attention_mask = None
 
             if attention_mask is not None:

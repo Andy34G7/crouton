@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from functools import partial
+import math
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +16,13 @@ from tokenisers import WpBpePpigTokenizer
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from crouton.data import PreferenceDataset
+from crouton.data import PreferenceDataset, collate_preference_batch
 from crouton.optim import build_adamw_param_groups, set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import (
     bf16_supported,
     get_device,
-    load_checkpoint,
+    instantiate_checkpoint_model,
+    load_checkpoint_payload,
     next_or_restart,
     save_checkpoint,
     validate_tokenizer_vocab,
@@ -28,11 +31,13 @@ from crouton.train.common import (
 
 def sequence_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Sum log-probabilities over non-masked tokens (labels != -100)."""
-    log_probs = F.log_softmax(logits.float(), dim=-1)
-    mask = labels != -100
-    safe_labels = labels.clamp(min=0)
-    token_logps = torch.gather(log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-    return (token_logps * mask).sum(dim=-1)
+    token_nll = F.cross_entropy(
+        logits.float().reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).view_as(labels)
+    return -token_nll.sum(dim=-1)
 
 
 def _log1mexp(x: torch.Tensor) -> torch.Tensor:
@@ -71,6 +76,32 @@ def orpo_loss(
     return chosen_sft_loss - beta * F.logsigmoid(log_odds).mean()
 
 
+def _validate_dpo_args(
+    seq_len: int,
+    total_steps: int,
+    micro_batch_size: int,
+    grad_accum_steps: int,
+    max_examples: int,
+    lr: float,
+    beta: float,
+    save_interval: int,
+    dataset_name: str,
+    require_dataset: bool = True,
+) -> None:
+    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1 or max_examples < 1:
+        raise ValueError("seq_len, total_steps, micro_batch_size, grad_accum_steps, and max_examples must be >= 1")
+    if (
+        not math.isfinite(lr)
+        or lr <= 0.0
+        or not math.isfinite(beta)
+        or beta <= 0.0
+        or save_interval < 0
+    ):
+        raise ValueError("lr and beta must be finite > 0 and save_interval must be >= 0")
+    if require_dataset and (not isinstance(dataset_name, str) or not dataset_name.strip()):
+        raise ValueError("dataset_name must be non-empty")
+
+
 def run_preference_tuning(
     base_checkpoint: str,
     tokenizer_path: str,
@@ -90,30 +121,31 @@ def run_preference_tuning(
     seed: int = 42,
     pairs_override: list[dict[str, Any]] | None = None,
 ) -> None:
-    if seq_len < 1 or total_steps < 1 or micro_batch_size < 1 or grad_accum_steps < 1 or max_examples < 1:
-        raise ValueError("seq_len, total_steps, micro_batch_size, grad_accum_steps, and max_examples must be >= 1")
-    if lr <= 0.0 or beta <= 0.0 or save_interval < 0:
-        raise ValueError("lr and beta must be > 0 and save_interval must be >= 0")
+    _validate_dpo_args(
+        seq_len=seq_len,
+        total_steps=total_steps,
+        micro_batch_size=micro_batch_size,
+        grad_accum_steps=grad_accum_steps,
+        max_examples=max_examples,
+        lr=lr,
+        beta=beta,
+        save_interval=save_interval,
+        dataset_name=dataset_name,
+        require_dataset=pairs_override is None,
+    )
     torch.manual_seed(seed)
     device = get_device()
     use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    policy, model_cfg, _ = load_checkpoint(base_checkpoint, device=device, override_seq_len=seq_len)
-    ref_model = None
-    if not use_orpo:
-        ref_model, _, _ = load_checkpoint(base_checkpoint, device=device, override_seq_len=seq_len)
-        ref_model.eval()
-        for p in ref_model.parameters():
-            p.requires_grad = False
-
+    ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint, override_seq_len=seq_len)
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
 
     if pairs_override is not None:
         pairs = pairs_override
     else:
-        raw = load_dataset(dataset_name, subset, split="train", streaming=True)
+        raw = load_dataset(dataset_name.strip(), subset, split="train", streaming=True)
         pairs = []
         for row in raw:
             if "prompt" in row and "chosen" in row and "rejected" in row:
@@ -130,8 +162,21 @@ def run_preference_tuning(
     if not pairs:
         raise ValueError(f"Preference dataset '{dataset_name}' yielded zero valid (prompt, chosen, rejected) pairs.")
 
-    ds = PreferenceDataset(pairs, tokenizer=tokenizer, seq_len=seq_len)
-    loader = DataLoader(ds, batch_size=micro_batch_size, shuffle=True)
+    policy = instantiate_checkpoint_model(ckpt, model_cfg, device)
+    ref_model = None
+    if not use_orpo:
+        ref_model = instantiate_checkpoint_model(ckpt, model_cfg, device)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+
+    ds = PreferenceDataset(pairs, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
+    loader = DataLoader(
+        ds,
+        batch_size=micro_batch_size,
+        shuffle=True,
+        collate_fn=partial(collate_preference_batch, pad_id=ds.pad_id),
+    )
     it = iter(loader)
 
     opt = AdamW(build_adamw_param_groups(policy, weight_decay=0.01), lr=lr, betas=(0.9, 0.95))
@@ -226,12 +271,27 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    try:
+        _validate_dpo_args(
+            seq_len=args.seq_len,
+            total_steps=args.steps,
+            micro_batch_size=args.micro_batch,
+            grad_accum_steps=args.grad_accum,
+            max_examples=args.max_examples,
+            lr=args.lr,
+            beta=args.beta,
+            save_interval=args.save_interval,
+            dataset_name=args.dataset,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     subset = None if args.subset in (None, "none", "None", "") else args.subset
     run_preference_tuning(
         base_checkpoint=args.base_checkpoint,
         tokenizer_path=args.tokenizer,
         output_dir=args.output_dir,
-        dataset_name=args.dataset,
+        dataset_name=args.dataset.strip(),
         subset=subset,
         seq_len=args.seq_len,
         use_orpo=args.orpo,

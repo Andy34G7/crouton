@@ -12,6 +12,7 @@ from crouton.config import CroutonConfig
 from crouton.model.attention import (
     HybridSparseAttention,
     _get_cached_swa_block_mask,
+    _is_right_padded,
     _supports_cuda_flex_attention,
     build_padded_attn_mask,
     build_swa_sink_mask,
@@ -113,9 +114,11 @@ class CroutonForCausalLM(nn.Module):
         _, seq_len = input_ids.shape
         device = input_ids.device
 
-        # Check all-ones padding mask and fetch any @torch.compiler.disable FlexAttention mask
+        # Check right-padded masks and fetch any @torch.compiler.disable FlexAttention mask
         # before entering embedding/RoPE/transformer tensor ops so compiled graphs stay contiguous.
-        if attention_mask is not None and not torch.compiler.is_compiling() and bool(attention_mask.all().item()):
+        # Under strictly causal attention with right-padding, valid queries (q < valid_len) never
+        # attend to trailing pad keys (kv >= valid_len), avoiding O(T^2) 4D mask materialization.
+        if attention_mask is not None and not torch.compiler.is_compiling() and _is_right_padded(attention_mask):
             attention_mask = None
 
         swa_block_mask = None

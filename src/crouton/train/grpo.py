@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import re
 from contextlib import nullcontext
@@ -18,7 +19,8 @@ from crouton.data.pretrain_data import resolve_token_id
 from crouton.train.common import (
     bf16_supported,
     get_device,
-    load_checkpoint,
+    instantiate_checkpoint_model,
+    load_checkpoint_payload,
     safe_decode,
     save_checkpoint,
     validate_tokenizer_vocab,
@@ -149,6 +151,7 @@ def _gather_completion_logps(
     seq: torch.Tensor,
     prompt_len: int,
     max_seq_len: int,
+    vocab_limit: int | None = None,
 ) -> torch.Tensor:
     """Return per-token log-probabilities [T_gen] for generated tokens seq[0, prompt_len:]."""
     inp = seq[:, :-1]
@@ -160,9 +163,35 @@ def _gather_completion_logps(
     else:
         start_logit = prompt_len - 1
     logits = model(inp).logits[:, start_logit:, :].float()
+    if vocab_limit is not None:
+        logits = logits[..., :vocab_limit]
     tgt = tgt[:, -logits.size(1) :]
     log_probs = F.log_softmax(logits, dim=-1)
     return torch.gather(log_probs, -1, tgt.unsqueeze(-1)).squeeze(-1).squeeze(0)
+
+
+def _validate_grpo_args(
+    group_size: int,
+    steps: int,
+    max_new_tokens: int,
+    temperature: float,
+    lr: float,
+    kl_beta: float,
+    save_interval: int,
+    max_examples: int = 1,
+) -> None:
+    if steps < 1 or group_size < 1 or max_new_tokens < 1 or max_examples < 1:
+        raise ValueError("steps, group_size, max_new_tokens, and max_examples must be >= 1")
+    if (
+        not math.isfinite(temperature)
+        or temperature <= 0.0
+        or not math.isfinite(lr)
+        or lr <= 0.0
+        or not math.isfinite(kl_beta)
+        or kl_beta < 0.0
+        or save_interval < 0
+    ):
+        raise ValueError("temperature and lr must be finite > 0, and kl_beta / save_interval must be finite >= 0")
 
 
 def run_grpo(
@@ -182,28 +211,35 @@ def run_grpo(
 ) -> None:
     if not prompts_with_verifiers:
         raise ValueError("prompts_with_verifiers must be non-empty")
-    if steps < 1 or group_size < 1 or max_new_tokens < 1:
-        raise ValueError("steps, group_size, and max_new_tokens must be >= 1")
-    if temperature <= 0.0 or lr <= 0.0 or kl_beta < 0.0 or save_interval < 0:
-        raise ValueError("temperature and lr must be > 0, and kl_beta / save_interval must be >= 0")
+    _validate_grpo_args(
+        group_size=group_size,
+        steps=steps,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        lr=lr,
+        kl_beta=kl_beta,
+        save_interval=save_interval,
+    )
     torch.manual_seed(seed)
 
     device = get_device()
     use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    policy, model_cfg, _ = load_checkpoint(base_checkpoint, device=device)
+    ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint)
     if max_new_tokens >= model_cfg.max_seq_len:
         raise ValueError(
             f"max_new_tokens ({max_new_tokens}) must be < model max_seq_len ({model_cfg.max_seq_len})"
         )
-    ref_model, _, _ = load_checkpoint(base_checkpoint, device=device)
+    tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+    validate_tokenizer_vocab(tokenizer, model_cfg)
+
+    policy = instantiate_checkpoint_model(ckpt, model_cfg, device)
+    ref_model = instantiate_checkpoint_model(ckpt, model_cfg, device)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
 
-    tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
-    validate_tokenizer_vocab(tokenizer, model_cfg)
     eos_ids = [
         resolve_token_id(tokenizer, "<|im_end|>", fallback=0),
         resolve_token_id(tokenizer, "<|endoftext|>", fallback=0),
@@ -237,19 +273,35 @@ def run_grpo(
             rewards.append(verifier(text))
 
             with torch.no_grad(), amp_ctx:
-                ref_tok_logps.append(_gather_completion_logps(ref_model, seq, p_len, model_cfg.max_seq_len))
+                ref_tok_logps.append(
+                    _gather_completion_logps(
+                        ref_model,
+                        seq,
+                        p_len,
+                        model_cfg.max_seq_len,
+                        vocab_limit=tokenizer.vocab_size,
+                    )
+                )
 
         rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
         std = rewards_t.std(unbiased=False)
         advantages = (rewards_t - rewards_t.mean()) / (std + 1e-6) if std > 1e-8 else torch.zeros_like(rewards_t)
 
-        policy.train()
+        # Keep deterministic eval routing during GRPO log-prob & KL computation so policy,
+        # rollout, and ref_model match identically when router_jitter > 0.
+        policy.eval()
         opt.zero_grad(set_to_none=True)
         step_loss = 0.0
         # Accumulate per-completion gradients sequentially to reduce peak activation memory by group_size x.
         for g, seq in enumerate(completions):
             with amp_ctx:
-                cur_lp = _gather_completion_logps(policy, seq, p_len, model_cfg.max_seq_len)
+                cur_lp = _gather_completion_logps(
+                    policy,
+                    seq,
+                    p_len,
+                    model_cfg.max_seq_len,
+                    vocab_limit=tokenizer.vocab_size,
+                )
                 loss_g = _grpo_elementwise_loss(
                     cur_lp,
                     cur_lp.detach(),
@@ -291,10 +343,25 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    if args.steps < 1 or args.group_size < 1 or args.max_new_tokens < 1 or args.max_examples < 1:
-        parser.error("--steps, --group-size, --max-new-tokens, and --max-examples must all be >= 1")
-    if args.temperature <= 0.0 or args.lr <= 0.0 or args.kl_beta < 0.0 or args.save_interval < 0:
-        parser.error("--temperature and --lr must be > 0, and --kl-beta / --save-interval must be >= 0")
+    try:
+        _validate_grpo_args(
+            group_size=args.group_size,
+            steps=args.steps,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            lr=args.lr,
+            kl_beta=args.kl_beta,
+            save_interval=args.save_interval,
+            max_examples=args.max_examples,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    # Validate checkpoint config, max_new_tokens bound, and tokenizer before HF GSM8K streaming.
+    _, cfg, _ = load_checkpoint_payload(args.base_checkpoint)
+    if args.max_new_tokens >= cfg.max_seq_len:
+        raise ValueError(f"max_new_tokens ({args.max_new_tokens}) must be < model max_seq_len ({cfg.max_seq_len})")
+    validate_tokenizer_vocab(WpBpePpigTokenizer.from_pretrained(args.tokenizer), cfg)
 
     tasks = (
         build_builtin_math_tasks(n=max(args.steps, 64), seed=args.seed)

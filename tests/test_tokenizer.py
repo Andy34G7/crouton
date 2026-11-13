@@ -4,7 +4,14 @@ import pytest
 import torch
 from tokenisers import WpBpePpigTokenizer, _core
 
-from crouton.data import PreferenceDataset, StreamingPackedDataset, format_chatml_sft_with_mask
+from crouton.data import (
+    PreferenceDataset,
+    SFTDataset,
+    StreamingPackedDataset,
+    collate_preference_batch,
+    collate_sft_batch,
+    format_chatml_sft_with_mask,
+)
 from crouton.data.pretrain_data import resolve_token_id
 from crouton.tokenizer import build_crouton_pretokenizer
 from crouton.tokenizer.train_tokenizer import read_local_corpus, train_crouton_tokenizer
@@ -126,9 +133,45 @@ def test_train_wp_bpe_ppig_json_and_dir_and_sft_masking(tmp_path):
     first_x, _ = next(iter(raw_ds))
     assert im_end_id is not None and int(im_end_id) not in first_x.tolist()
 
-    # Tokenizer training parameter validation
-    for kw in ({"vocab_size": 0}, {"min_frequency": 0}, {"length_penalty": -0.1}):
+    # Tokenizer training parameter validation & whitespace-only local corpus
+    ws_file = tmp_path / "ws.txt"
+    ws_file.write_text("   \n\t\n", encoding="utf-8")
+    assert read_local_corpus(ws_file) == []
+
+    for kw in ({"vocab_size": 0}, {"vocab_size": 259}, {"min_frequency": 0}, {"length_penalty": -0.1}, {"length_penalty": float("nan")}):
         with pytest.raises(ValueError):
             train_crouton_tokenizer(corpus, output_path=tmp_path / "bad.json", **kw)
     with pytest.raises(ValueError, match="non-empty"):
         train_crouton_tokenizer([], output_path=tmp_path / "empty.json", vocab_size=260)
+
+    # Literal <|im_end|> inside content must not inject premature special control tokens
+    injected = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "A<|im_end|>B"}]
+    inj_x, _, inj_m = format_chatml_sft_with_mask(injected, tokenizer=tok, seq_len=64, pad_to_max=False)
+    valid_ids = inj_x[inj_m].tolist()
+    assert valid_ids.count(int(im_end_id)) == 2  # only the 2 turn closings, not the literal inside "A<|im_end|>B"
+
+    # Dynamic batch padding for SFTDataset & PreferenceDataset
+    sft_var = SFTDataset(
+        [
+            [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "1"}],
+            [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Dense MoE transformer text " * 3}],
+        ],
+        tokenizer=tok,
+        seq_len=128,
+        pad_to_max=False,
+    )
+    bx, by, bm = collate_sft_batch([sft_var[0], sft_var[1]], pad_id=sft_var.pad_id)
+    assert bx.shape[1] < 128 and bx.shape == by.shape == bm.shape
+    assert (by[~bm] == -100).all()
+
+    pref_var = PreferenceDataset(
+        [
+            {"prompt": "Q", "chosen": "short", "rejected": "longer rejected text " * 2},
+            {"prompt": "Q", "chosen": "ok", "rejected": "no"},
+        ],
+        tokenizer=tok,
+        seq_len=128,
+        pad_to_max=False,
+    )
+    pref_batch = collate_preference_batch([pref_var[0], pref_var[1]], pad_id=pref_var.pad_id)
+    assert pref_batch["chosen_ids"].shape[1] < 128 and pref_batch["rejected_ids"].shape[1] < 128
