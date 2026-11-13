@@ -1,21 +1,120 @@
 # crouton
 
-A scalable language model family (from ~15M prototypes up to ~300M parameters) designed to test **Merged-LoRA Dense MoE with $\text{ReLU}^2$** and **Hybrid Sparse Attention** against `shortcake`.
+A scalable PyTorch language model family (from ~14M prototypes up to ~300M parameters) implementing **Merged-LoRA Dense MoE (Mixture of Experts) with ReLU^2** and **Hybrid Sparse Attention**, trained with a **`wp-bpe-ppig`** tokenizer and evaluated with tokenizer-agnostic Bits-Per-Byte (BPB) and `lm-eval-harness` (enabling comparison against external baselines such as `shortcake` via `--compare-checkpoint` or standalone BPB metrics).
+
+## Setup & Installation
+
+- **Python**: `>=3.11`
+- **Sibling dependency**: Requires [`../tokenisers`](../tokenisers) checked out alongside this repository (`pyproject.toml` links `../tokenisers` via `[tool.uv.sources]`).
+
+```bash
+# Recommended (using uv)
+uv sync --extra dev          # includes pytest
+uv sync --extra dev --extra eval   # adds lm-eval>=0.4.0 for benchmark tasks
+
+# Alternative (pip)
+pip install -e ../tokenisers -e ".[dev]"
+```
+
+## Model Configurations
+
+`CroutonConfig` ([`src/crouton/config.py`](src/crouton/config.py)) exposes discrete integer hyperparameters (`d_model`, `n_layers`, `n_heads`, `n_kv_heads`, `d_ff`, `n_experts`, `expert_rank`) subject to `d_model % n_heads == 0`, `n_heads % n_kv_heads == 0`, and even `head_dim`. Shipped presets in `configs/`:
+
+| Preset | Total Params | Non-Embedding Params | `d_model` | `n_layers` | `n_heads` / `n_kv_heads` | `d_ff` | `n_experts` (rank) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| [`configs/model_tiny.yaml`](configs/model_tiny.yaml) | 14,169,344 (~14.2M) | 5,780,736 | 256 | 8 | 4 / 2 | 768 | 4 (16) |
+| [`configs/model_small.yaml`](configs/model_small.yaml) | 84,691,584 (~84.7M) | 63,720,064 | 640 | 16 | 10 / 2 | 1792 | 6 (24) |
+| [`configs/model_300m.yaml`](configs/model_300m.yaml) | 298,045,440 (~298.0M) | 264,491,008 | 1024 | 24 | 16 / 4 | 3072 | 8 (32) |
 
 ## Architecture
-- **Flexible Scaling**: Continuous depth, width, head, and expert knobs (`CroutonConfig`).
-- **Dense MoE ($\text{ReLU}^2$)**: 2-layer $\text{ReLU}^2$ MLP (`W_down(ReLU(W_up(x))²)`) with a shared base FFN plus input-dependent merged low-rank (LoRA) expert deltas via a learned softmax router (100% differentiable, zero token dropping).
-- **Hybrid Sparse Attention**: Alternating Sliding Window Attention (`512` tokens) + attention sinks and Global Full Attention layers (default `3:1` SWA:Global), using `FlexAttention` on CUDA and SDPA fallback on CPU.
-- **Context Length**: `2048` in pretraining, extendable to `4096` via YaRN/NTK RoPE scaling in mid-training.
+
+- **Tied Embeddings**: Input and output token embeddings are tied by default (`tie_embeddings=True` in `CroutonConfig`).
+- **Merged-LoRA Dense MoE (ReLU^2)** ([`src/crouton/model/moe.py`](src/crouton/model/moe.py)): End-to-end differentiable 2-layer MLP with no token dropping, injecting router-weighted low-rank (LoRA) expert deltas scaled by `scale = expert_alpha / expert_rank` into both `w_up` (pre-nonlinearity) and `w_down`:
+  - `act = ReLU(w_up(x) + scale * sum_e w_e * (x @ A_up[e] @ B_up[e]))^2`
+  - `y = w_down(act) + scale * sum_e w_e * (act @ A_down[e] @ B_down[e])`
+  - Router entropy (`router_entropy`) is computed and logged during training with no auxiliary load-balancing loss.
+- **Hybrid Sparse Attention** ([`src/crouton/model/attention.py`](src/crouton/model/attention.py)): Grouped-Query Attention (GQA) with RMSNorm QK-Norm (`qk_norm=True`), alternating Sliding Window Attention (SWA; `sliding_window=512`, `sink_tokens=4`) and Global Full Attention every `global_layer_interval=4` layers (3:1 ratio; final layer `n_layers - 1` is always Global via `is_global_layer`).
+  - **Dispatch**: Global layers always use causal Scaled Dot-Product Attention (SDPA). SWA layers use cached `FlexAttention` block masks on CUDA when `use_flex_attention=True` and masked SDPA on non-CUDA devices or when `use_flex_attention=False`.
+- **Context Length & RoPE Scaling** ([`src/crouton/model/rope.py`](src/crouton/model/rope.py)): Pretrained at `2048` tokens and extendable to `4096` in mid-training via YaRN (`rope_scaling_type="yarn"`, wavelength-band ramp + `mscale`) or NTK-aware base scaling (`"ntk"`).
 
 ## Tokenizer
-- **`wp-bpe-ppig`** from [`../tokenisers`](../tokenisers) trained on our dataset (`32,768` vocab, tied embeddings).
-- **Pretokenization**: Custom HF `Sequence` combining a Llama-3/cl100k-style regex `Split` and `Digits(individual_digits=True)`.
+
+- **Algorithm**: `WpBpePpigTokenizer` (`wp-bpe-ppig`) from the sibling [`../tokenisers`](../tokenisers) repo (`vocab_size=32768`, `length_penalty=0.35`, `min_frequency=2`), registering 4 special tokens: `<|endoftext|>`, `<|im_start|>`, `<|im_end|>`, and `<|pad|>`.
+- **Pretokenization** ([`src/crouton/tokenizer/pretokenizer.py`](src/crouton/tokenizer/pretokenizer.py)): Hugging Face (HF) `Sequence` pretokenizer (`{"hf": ...}`) combining a Llama-3/cl100k-style regex `Split` (`behavior="Isolated"`) and `Digits(individual_digits=True)` (toggleable via `--no-individual-digits`).
+- **Training Corpus** ([`src/crouton/tokenizer/train_tokenizer.py`](src/crouton/tokenizer/train_tokenizer.py)): Streams 50,000 interleaved documents from `HuggingFaceFW/fineweb-edu` (`sample-10BT`) and `HuggingFaceTB/smollm-corpus` (`cosmopedia-v2`) by default (or `--local-file`), exporting a single HF JSON file when `--output` ends in `.json` (or a directory otherwise).
 
 ## Training & Post-Training Pipeline
-1. **Tokenizer Training**: `python -m crouton.tokenizer.train_tokenizer`
-2. **Pretraining**: Muon (2D linear weights) + AdamW (embeddings/norms/router) with WSD schedule (`bf16`, gradient accumulation, `torch.compile`) on FineWeb-Edu + Cosmopedia/SmolLM-corpus (`python -m crouton.train.pretrain`).
-3. **Stage 1 — Annealing / Mid-training**: WSD decay phase + `4096` context extension on high-quality data (`python -m crouton.train.midtrain`).
-4. **Stage 2 — Chat / Instruct SFT**: Assistant-masked SFT on SmolTalk / Tulu-3 (`python -m crouton.train.sft`).
-5. **Stage 3 — Preference & Reasoning**: DPO/ORPO (`python -m crouton.train.dpo`) + optional GRPO (`python -m crouton.train.grpo`).
-6. **Evaluation**: Validation BPB/PPL + `lm-eval-harness` (`python -m crouton.eval.eval_runner`).
+
+1. **Tokenizer Training**:
+
+```bash
+python -m crouton.tokenizer.train_tokenizer \
+  --output artifacts/tokenizer/wp_bpe_ppig_32k.json \
+  --vocab-size 32768
+```
+
+2. **Pretraining** (`Muon` for 2D `blocks.*` weights excluding router/embeddings/head; `AdamW` for 3D LoRA expert tensors, router, embeddings, norms, and untied head; Warmup-Stable-Decay (WSD) schedule; `bf16` autocast and `torch.compile` on CUDA; checkpoints unwrap `_orig_mod.` automatically):
+
+```bash
+python -m crouton.train.pretrain \
+  --model-config configs/model_300m.yaml \
+  --tokenizer artifacts/tokenizer/wp_bpe_ppig_32k.json \
+  --output-dir checkpoints/pretrain
+```
+
+3. **Stage 1 — Annealing / Mid-training** (WSD cosine decay from `1.0 -> 0.05` with `--warmup-steps 0` default + `4096` YaRN RoPE context extension on `cosmopedia-v2` + `fineweb-edu`, or custom `--dataset` / `--local-file`):
+
+```bash
+python -m crouton.train.midtrain \
+  --base-checkpoint checkpoints/pretrain/final.pt \
+  --tokenizer artifacts/tokenizer/wp_bpe_ppig_32k.json \
+  --output-dir checkpoints/midtrain \
+  --seq-len 4096 --rope-scale 2.0 --rope-scaling yarn
+```
+
+4. **Stage 2 — Chat / Instruct SFT (Supervised Fine-Tuning)** (`AdamW` with ChatML assistant-only loss masking and `attention_mask` padding on `--preset smoltalk` (`HuggingFaceTB/smoltalk`) or `--preset tulu3` (`allenai/tulu-3-sft-mixture`)):
+
+```bash
+python -m crouton.train.sft \
+  --base-checkpoint checkpoints/midtrain/final.pt \
+  --tokenizer artifacts/tokenizer/wp_bpe_ppig_32k.json \
+  --output-dir checkpoints/sft \
+  --preset smoltalk --seq-len 4096
+```
+
+5. **Stage 3a — Preference Tuning (DPO / ORPO)** (`AdamW`, `seq_len=4096`, multi-turn history preserved on `argilla/ultrafeedback-binarized-preferences-cleaned`; add `--orpo` for reference-free Odds Ratio Preference Optimization):
+
+```bash
+python -m crouton.train.dpo \
+  --base-checkpoint checkpoints/sft/final.pt \
+  --tokenizer artifacts/tokenizer/wp_bpe_ppig_32k.json \
+  --output-dir checkpoints/dpo \
+  --seq-len 4096
+```
+
+6. **Stage 3b — Reasoning RL via GRPO (Group Relative Policy Optimization, Optional)** (runs on `openai/gsm8k` with exact numeric `#### <answer>` reward verification, or `--builtin-math` for offline arithmetic tasks):
+
+```bash
+python -m crouton.train.grpo \
+  --base-checkpoint checkpoints/dpo/final.pt \
+  --tokenizer artifacts/tokenizer/wp_bpe_ppig_32k.json \
+  --output-dir checkpoints/grpo
+```
+
+7. **Evaluation** (validation loss, Perplexity (PPL), and Bits-Per-Byte (BPB) via `--val-file`, and/or `lm-eval-harness` benchmarks via `--tasks`; pass `--compare-checkpoint` for side-by-side comparison):
+
+```bash
+python -m crouton.eval.eval_runner \
+  --checkpoint checkpoints/dpo/final.pt \
+  --tokenizer artifacts/tokenizer/wp_bpe_ppig_32k.json \
+  --val-file path/to/val.txt \
+  --tasks hellaswag,arc_easy,piqa
+```
+
+## Verification & Testing
+
+Run the unit and end-to-end smoke test suite (covering SWA+sink masks, YaRN/NTK RoPE, `attention_mask`, `generate()`, `Muon`+`AdamW`+`WSD`, `_orig_mod.` checkpoint loading, `wp-bpe-ppig` pretokenization, and all training/eval stages):
+
+```bash
+PYTHONPATH=src pytest -v
+```
