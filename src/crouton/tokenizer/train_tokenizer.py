@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 from pathlib import Path
 
 from tokenisers import WpBpePpigTokenizer
@@ -10,35 +11,58 @@ from tokenisers import WpBpePpigTokenizer
 from crouton.tokenizer.pretokenizer import DEFAULT_SPECIAL_TOKENS, build_crouton_pretokenizer
 
 
+DEFAULT_TOKENIZER_SOURCES = [
+    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
+    ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
+]
+
+
 def iter_hf_corpus(
-    dataset_name: str,
-    subset: str | None,
-    split: str,
-    text_field: str,
+    sources: list[tuple[str, str | None, str, str]],
     max_docs: int,
 ) -> list[str]:
     from datasets import load_dataset
 
-    ds = load_dataset(dataset_name, subset, split=split, streaming=True)
+    iters = [iter(load_dataset(name, subset, split=split, streaming=True)) for name, subset, split, _ in sources]
+    fields = [field for _, _, _, field in sources]
+
     texts: list[str] = []
-    for i, row in enumerate(ds):
-        if i >= max_docs:
-            break
-        val = row.get(text_field, "")
+    idx = 0
+    exhausted = set()
+    while len(texts) < max_docs and len(exhausted) < len(iters):
+        stream_i = idx % len(iters)
+        idx += 1
+        if stream_i in exhausted:
+            continue
+        try:
+            row = next(iters[stream_i])
+        except StopIteration:
+            exhausted.add(stream_i)
+            continue
+        val = row.get(fields[stream_i], "")
         if isinstance(val, str) and val.strip():
             texts.append(val)
     return texts
 
 
+def read_local_corpus(path: str | Path) -> list[str]:
+    text = Path(path).read_text(encoding="utf-8")
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines if lines else ([text] if text else [])
+
+
 def train_crouton_tokenizer(
-    corpus: list[str] | str,
+    corpus: list[str],
     output_path: str | Path,
     vocab_size: int = 32768,
     length_penalty: float = 0.35,
     min_frequency: int = 2,
     individual_digits: bool = True,
 ) -> WpBpePpigTokenizer:
-    """Train WpBpePpigTokenizer with crouton pretokenizer and save to `output_path`."""
+    """Train WpBpePpigTokenizer with crouton pretokenizer and export to `output_path`."""
+    if isinstance(corpus, str):
+        corpus = [line for line in corpus.splitlines() if line.strip()] or [corpus]
+
     pretokenizer = build_crouton_pretokenizer(individual_digits=individual_digits)
     tok = WpBpePpigTokenizer.train(
         corpus=corpus,
@@ -49,8 +73,12 @@ def train_crouton_tokenizer(
         pretokenizer=pretokenizer,
     )
     out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tok.save(str(out))
+    if out.suffix == ".json":
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tok.export_hf_json(str(out))
+    else:
+        out.mkdir(parents=True, exist_ok=True)
+        tok.save_pretrained(str(out))
     return tok
 
 
@@ -62,23 +90,23 @@ def main() -> None:
     parser.add_argument("--min-frequency", type=int, default=2)
     parser.add_argument("--no-individual-digits", action="store_true")
     parser.add_argument("--local-file", type=str, default=None, help="Optional local UTF-8 text file")
-    parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu")
-    parser.add_argument("--subset", type=str, default="sample-10BT")
+    parser.add_argument("--dataset", type=str, default=None, help="Optional single HF dataset override")
+    parser.add_argument("--subset", type=str, default=None)
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--max-docs", type=int, default=50000)
     args = parser.parse_args()
 
     if args.local_file:
-        corpus: list[str] | str = Path(args.local_file).read_text(encoding="utf-8")
-    else:
+        corpus = read_local_corpus(args.local_file)
+    elif args.dataset:
+        subset = None if args.subset in (None, "none", "None", "") else args.subset
         corpus = iter_hf_corpus(
-            dataset_name=args.dataset,
-            subset=args.subset,
-            split=args.split,
-            text_field=args.text_field,
+            sources=[(args.dataset, subset, args.split, args.text_field)],
             max_docs=args.max_docs,
         )
+    else:
+        corpus = iter_hf_corpus(sources=DEFAULT_TOKENIZER_SOURCES, max_docs=args.max_docs)
 
     tok = train_crouton_tokenizer(
         corpus=corpus,

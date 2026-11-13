@@ -9,9 +9,17 @@ import torch
 from torch.utils.data import IterableDataset
 
 
+def resolve_token_id(tokenizer, token: str, fallback: int = 0) -> int:
+    tid = tokenizer.token_to_id(token)
+    if tid is not None:
+        return int(tid)
+    encoded = tokenizer.encode(token)
+    return int(encoded[0]) if encoded else fallback
+
+
 class StreamingPackedDataset(IterableDataset):
     """
-    Streams text documents from HuggingFace datasets (or an iterator of strings),
+    Streams text documents from HuggingFace datasets (or local texts),
     encodes with wp-bpe-ppig, appends EOS, and packs into fixed (seq_len + 1) chunks.
     """
 
@@ -28,10 +36,10 @@ class StreamingPackedDataset(IterableDataset):
         self.seq_len = seq_len
         self.sources = sources or [
             ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
+            ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
         ]
         self.local_texts = local_texts
-        eos_ids = tokenizer.encode(eos_token)
-        self.eos_id = eos_ids[0] if eos_ids else 0
+        self.eos_id = resolve_token_id(tokenizer, eos_token, fallback=0)
 
     def _iter_texts(self) -> Iterator[str]:
         if self.local_texts is not None:
