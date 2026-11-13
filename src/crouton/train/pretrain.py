@@ -21,6 +21,7 @@ from crouton.train.common import (
     next_or_restart,
     read_nonempty_lines,
     save_checkpoint,
+    strip_required_paths,
     validate_output_dir,
     validate_tokenizer_vocab,
 )
@@ -47,6 +48,10 @@ def run_pretrain(
 ) -> None:
     model_cfg.__post_init__()
     train_cfg.__post_init__()
+    if train_cfg.seq_len > model_cfg.max_seq_len:
+        raise ValueError(
+            f"train_cfg.seq_len ({train_cfg.seq_len}) must be <= model_cfg.max_seq_len ({model_cfg.max_seq_len})"
+        )
     validate_output_dir(train_cfg.output_dir)
     torch.manual_seed(train_cfg.seed)
     device = get_device()
@@ -156,11 +161,6 @@ def main() -> None:
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
 
-    model_config_path = args.model_config.strip()
-    output_dir = args.output_dir.strip()
-    tokenizer_path = args.tokenizer.strip()
-    if not model_config_path or not output_dir or not tokenizer_path:
-        parser.error("--model-config, --output-dir, and --tokenizer must be non-empty")
     local_file = args.local_file.strip() if args.local_file is not None else None
     if local_file is not None and not local_file:
         parser.error("--local-file must be a non-empty file path")
@@ -173,11 +173,26 @@ def main() -> None:
     if args.seq_len is not None and args.seq_len < 1:
         parser.error("--seq-len must be >= 1")
     try:
+        model_config_path, output_dir, tokenizer_path = strip_required_paths(
+            **{
+                "--model-config": args.model_config,
+                "--output-dir": args.output_dir,
+                "--tokenizer": args.tokenizer,
+            }
+        )
         validate_output_dir(output_dir)
+        model_cfg = CroutonConfig.from_yaml(model_config_path)
+        if args.vocab_size is not None:
+            model_cfg.vocab_size = args.vocab_size
+        if args.seq_len is not None:
+            model_cfg.max_seq_len = args.seq_len
+            model_cfg.rope_original_max_seq_len = args.seq_len
+        model_cfg.__post_init__()
+        eff_seq_len = args.seq_len if args.seq_len is not None else model_cfg.max_seq_len
         train_cfg = TrainConfig(
             output_dir=output_dir,
             tokenizer_path=tokenizer_path,
-            seq_len=args.seq_len if args.seq_len is not None else 1,
+            seq_len=eff_seq_len,
             micro_batch_size=args.micro_batch,
             grad_accum_steps=args.grad_accum,
             total_steps=args.steps,
@@ -194,15 +209,6 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    model_cfg = CroutonConfig.from_yaml(model_config_path)
-    if args.vocab_size is not None:
-        model_cfg.vocab_size = args.vocab_size
-    if args.seq_len is not None:
-        model_cfg.max_seq_len = args.seq_len
-        model_cfg.rope_original_max_seq_len = args.seq_len
-    model_cfg.__post_init__()
-    if args.seq_len is None:
-        train_cfg.seq_len = model_cfg.max_seq_len
     run_pretrain(model_cfg, train_cfg, local_file=local_file, val_file=val_file)
 
 

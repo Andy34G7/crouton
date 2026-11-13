@@ -1,5 +1,7 @@
 """Tests for wp-bpe-ppig pretokenizer rules, JSON/dir export, ChatML SFT masking, and multi-turn prefs."""
 
+import sys
+
 import pytest
 import torch
 from tokenisers import WpBpePpigTokenizer, _core
@@ -11,6 +13,7 @@ from crouton.data import (
     collate_preference_batch,
     collate_sft_batch,
     format_chatml_sft_with_mask,
+    is_valid_preference_pair,
 )
 from crouton.data.pretrain_data import resolve_token_id
 from crouton.tokenizer import build_crouton_pretokenizer
@@ -178,17 +181,6 @@ def test_train_wp_bpe_ppig_json_and_dir_and_sft_masking(tmp_path):
 
 
 def test_posttrain_validation_padding_and_streaming_cursor(tmp_path):
-    import pytest
-    import torch
-    from crouton.data import (
-        PreferenceDataset,
-        SFTDataset,
-        StreamingPackedDataset,
-        collate_sft_batch,
-        format_chatml_sft_with_mask,
-        is_valid_preference_pair,
-    )
-
     corpus = ["Dense MoE transformer training text. " * 20]
     tok = train_crouton_tokenizer(corpus, output_path=tmp_path / "tok.json", vocab_size=260)
     msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
@@ -247,8 +239,6 @@ def test_posttrain_validation_padding_and_streaming_cursor(tmp_path):
 
 
 def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
-    import sys
-    import pytest
     from crouton.tokenizer import train_tokenizer as tok_cli
 
     text_file = tmp_path / "train.txt"
@@ -325,6 +315,7 @@ def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
         str(conflict_file / "tok.json"),
         f"{tmp_path / 'dir_slash.json'}/",
         f"{tmp_path / 'dir_dot.json'}/.",
+        f"{tmp_path / 'dir_dotdot.json'}/..",
     ):
         monkeypatch.setattr(sys, "argv", ["crouton-train-tokenizer", "--output", bad_out])
         with pytest.raises(SystemExit):
@@ -332,8 +323,45 @@ def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="directory"):
             train_crouton_tokenizer(["hello world"], output_path=bad_out, vocab_size=260)
 
-    # Whitespace-padded ChatML role matches supervision rules consistently across SFT & DPO
+    # Sequence container & type validation across tokenizer/data APIs
     tok = WpBpePpigTokenizer.from_pretrained(str(out_tok))
+    with pytest.raises(ValueError):
+        train_crouton_tokenizer(["hello world"], output_path=tmp_path / "bool_v.json", vocab_size=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="corpus"):
+        train_crouton_tokenizer(123, output_path=tmp_path / "int_c.json", vocab_size=260)  # type: ignore[arg-type]
+
+    for bad_seq in ("bare_string", (x for x in [])):
+        with pytest.raises(ValueError, match="list or tuple"):
+            StreamingPackedDataset(tokenizer=tok, seq_len=8, local_texts=bad_seq)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            StreamingPackedDataset(tokenizer=tok, seq_len=8, sources=bad_seq)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            format_chatml_sft_with_mask(bad_seq, tok, seq_len=8)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            collate_sft_batch(bad_seq)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            collate_preference_batch(bad_seq)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            SFTDataset(bad_seq, tok, seq_len=8)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            PreferenceDataset(bad_seq, tok, seq_len=8)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="shuffle_buffer"):
+        StreamingPackedDataset(tokenizer=tok, seq_len=8, local_texts=["hi"], shuffle_buffer=0)
+    with pytest.raises(ValueError, match="messages"):
+        format_chatml_sft_with_mask([], tok, seq_len=8)
+    sample = format_chatml_sft_with_mask(
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}],
+        tok,
+        seq_len=8,
+        pad_to_max=False,
+    )
+    with pytest.raises(ValueError, match="pad_to_multiple"):
+        collate_sft_batch([sample], pad_to_multiple=0)
+    with pytest.raises(ValueError, match="max_seq_len"):
+        collate_sft_batch([sample], max_seq_len=0)
+
+    # Whitespace-padded ChatML role matches supervision rules consistently across SFT & DPO
     x_ws, y_ws, _ = format_chatml_sft_with_mask(
         [{"role": "user", "content": "Hi"}, {"role": " assistant ", "content": "ok"}],
         tok,

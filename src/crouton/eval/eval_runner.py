@@ -63,6 +63,8 @@ class _TokenizerCompat:
         return list(self._tokenizer.encode(text, **encode_kwargs))
 
     def decode(self, tokens: list[int], skip_special_tokens: bool = False, **kwargs) -> str:
+        if isinstance(tokens, (int, bool, str, bytes)) or not hasattr(tokens, "__iter__"):
+            raise ValueError("tokens must be a sequence or iterable of integer token IDs")
         toks = [int(t) for t in tokens]
         if skip_special_tokens:
             special_ids = set(self._tokenizer.special_tokens().values())
@@ -378,8 +380,6 @@ def evaluate_bpb(
         raise ValueError("Evaluation texts must contain at least one non-empty string")
     ckpt, model_cfg, _ = load_checkpoint_payload(checkpoint_path)
     eff_seq_len = seq_len if seq_len is not None else model_cfg.max_seq_len
-    if eff_seq_len < 1:
-        raise ValueError("seq_len must be >= 1")
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
     device = get_device()
@@ -429,10 +429,12 @@ def main() -> None:
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
 
-    checkpoint_path = args.checkpoint.strip()
-    tokenizer_path = args.tokenizer.strip()
-    if not checkpoint_path or not tokenizer_path:
-        parser.error("--checkpoint and --tokenizer must be non-empty")
+    try:
+        checkpoint_path, tokenizer_path = strip_required_paths(
+            **{"--checkpoint": args.checkpoint, "--tokenizer": args.tokenizer}
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     compare_checkpoint = args.compare_checkpoint.strip() if args.compare_checkpoint is not None else None
     if compare_checkpoint is not None and not compare_checkpoint:
@@ -473,13 +475,11 @@ def main() -> None:
 
     # Pre-validate tokenizer and both checkpoints before running potentially long evaluations.
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
-    for ckpt_label, ckpt_path in (("primary", checkpoint_path), ("compare", compare_checkpoint)):
+    for ckpt_path in (checkpoint_path, compare_checkpoint):
         if ckpt_path is None:
             continue
         _, ckpt_cfg, _ = load_checkpoint_payload(ckpt_path)
         validate_tokenizer_vocab(tokenizer, ckpt_cfg)
-        if texts is not None and args.seq_len is None and ckpt_cfg.max_seq_len < 1:
-            raise ValueError(f"{ckpt_label} checkpoint max_seq_len must be >= 1")
 
     use_bf16 = not args.no_bf16
     report: dict[str, Any] = {"primary": {}}

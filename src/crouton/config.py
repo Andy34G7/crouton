@@ -2,12 +2,55 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 import math
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+REQUIRED_CONFIG_KEYS = (
+    "vocab_size",
+    "d_model",
+    "n_layers",
+    "n_heads",
+    "n_kv_heads",
+    "d_ff",
+    "n_experts",
+    "expert_rank",
+    "max_seq_len",
+)
+
+
+def _require_int_fields(obj: Any, names: tuple[str, ...]) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not isinstance(val, int) or isinstance(val, bool):
+            raise ValueError(f"{name} must be an integer, got {type(val).__name__}")
+
+
+def _require_num_fields(obj: Any, names: tuple[str, ...]) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            raise ValueError(f"{name} must be a finite number, got {type(val).__name__}")
+
+
+def _require_bool_fields(obj: Any, names: tuple[str, ...]) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not isinstance(val, bool):
+            raise ValueError(f"{name} must be a boolean, got {type(val).__name__}")
+
+
+def _clean_yaml_path(path: str | Path) -> Path:
+    if isinstance(path, str):
+        if not path.strip():
+            raise ValueError("YAML config path must be non-empty")
+        return Path(path.strip())
+    if isinstance(path, Path) and str(path).strip():
+        return path
+    raise ValueError("YAML config path must be non-empty")
 
 
 @dataclass
@@ -39,6 +82,31 @@ class CroutonConfig:
     use_flex_attention: bool = True
 
     def __post_init__(self) -> None:
+        _require_int_fields(
+            self,
+            (
+                "vocab_size",
+                "d_model",
+                "n_layers",
+                "n_heads",
+                "n_kv_heads",
+                "d_ff",
+                "n_experts",
+                "expert_rank",
+                "max_seq_len",
+                "sliding_window",
+                "sink_tokens",
+                "global_layer_interval",
+                "rope_original_max_seq_len",
+            ),
+        )
+        _require_num_fields(
+            self,
+            ("expert_alpha", "rope_theta", "rope_scale_factor", "norm_eps", "logit_softcap", "router_jitter"),
+        )
+        _require_bool_fields(self, ("tie_embeddings", "qk_norm", "use_flex_attention"))
+        if not isinstance(self.rope_scaling_type, str):
+            raise ValueError(f"rope_scaling_type must be a string, got {type(self.rope_scaling_type).__name__}")
         if (
             self.vocab_size < 1
             or self.d_model < 1
@@ -99,15 +167,33 @@ class CroutonConfig:
         return asdict(self)
 
     def to_yaml(self, path: str | Path) -> None:
-        Path(path).write_text(yaml.safe_dump(self.to_dict(), sort_keys=False))
+        out = _clean_yaml_path(path)
+        if out.is_dir():
+            raise ValueError(f"YAML output path {str(out)!r} must be a file path, not a directory")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(yaml.safe_dump(self.to_dict(), sort_keys=False), encoding="utf-8")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> CroutonConfig:
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        src = _clean_yaml_path(path)
+        try:
+            data = yaml.safe_load(src.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML in {path}: {exc}") from exc
         if not isinstance(data, dict):
             raise ValueError(f"Expected YAML mapping in {path}, got {type(data).__name__}")
+        valid_fields = {f.name for f in fields(cls)}
+        unknown = sorted(set(data) - valid_fields)
+        if unknown:
+            raise ValueError(f"Invalid CroutonConfig fields in {path}: unexpected key(s) {', '.join(unknown)}")
+        missing = [k for k in REQUIRED_CONFIG_KEYS if k not in data]
+        if missing:
+            raise ValueError(f"Missing required CroutonConfig keys in {path}: {', '.join(missing)}")
+        cfg_data = dict(data)
+        if "rope_original_max_seq_len" not in cfg_data:
+            cfg_data["rope_original_max_seq_len"] = cfg_data["max_seq_len"]
         try:
-            return cls(**data)
+            return cls(**cfg_data)
         except TypeError as exc:
             raise ValueError(f"Invalid CroutonConfig fields in {path}: {exc}") from exc
 
@@ -146,6 +232,23 @@ class TrainConfig:
             raise ValueError("output_dir and tokenizer_path must be non-empty")
         self.output_dir = self.output_dir.strip()
         self.tokenizer_path = self.tokenizer_path.strip()
+        _require_int_fields(
+            self,
+            (
+                "seq_len",
+                "micro_batch_size",
+                "grad_accum_steps",
+                "total_steps",
+                "warmup_steps",
+                "decay_steps",
+                "log_interval",
+                "eval_interval",
+                "save_interval",
+                "seed",
+            ),
+        )
+        _require_num_fields(self, ("muon_lr", "adamw_lr", "min_lr_ratio", "weight_decay", "grad_clip"))
+        _require_bool_fields(self, ("bf16", "compile_model"))
         if (
             self.seq_len < 1
             or self.micro_batch_size < 1

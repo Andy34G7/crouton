@@ -2,10 +2,47 @@
 
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Any, Iterator
 
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
+
+
+def normalize_optional_subset(subset: str | None) -> str | None:
+    """Normalize optional HF subset names so blank or 'none' markers map cleanly to None."""
+    if subset is None:
+        return None
+    if not isinstance(subset, str):
+        raise ValueError("subset must be a string when specified")
+    cleaned = subset.strip()
+    return None if cleaned in ("", "none", "None") else cleaned
+
+
+def validate_sequence_arg(value: Any, name: str) -> None:
+    """Require a list or tuple sequence container (rejecting bare strings, bytes, and single-use iterators)."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a list or tuple")
+
+
+def validate_hf_sources(sources: Any) -> list[tuple[str, str | None, str, str]]:
+    """Validate and normalize a sequence of (dataset_name, subset, split, text_field) tuples."""
+    validate_sequence_arg(sources, "sources")
+    normalized: list[tuple[str, str | None, str, str]] = []
+    for entry in sources:
+        if not isinstance(entry, (tuple, list)) or len(entry) != 4:
+            raise ValueError("Each source entry must be a 4-tuple of (dataset_name, subset, split, text_field)")
+        name, subset, split, field = entry
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(split, str)
+            or not split.strip()
+            or not isinstance(field, str)
+            or not field.strip()
+        ):
+            raise ValueError("Each source entry must have non-empty strings for dataset_name, split, and text_field")
+        normalized.append((name.strip(), normalize_optional_subset(subset), split.strip(), field.strip()))
+    return normalized
 
 
 def resolve_token_id(tokenizer, token: str, fallback: int = 0) -> int:
@@ -14,6 +51,11 @@ def resolve_token_id(tokenizer, token: str, fallback: int = 0) -> int:
         return int(tid)
     encoded = tokenizer.encode(token)
     return int(encoded[0]) if len(encoded) == 1 else fallback
+
+
+def resolve_pad_token_id(tokenizer) -> int:
+    """Resolve <|pad|>, falling back to <|endoftext|> and finally 0."""
+    return resolve_token_id(tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0))
 
 
 class StreamingPackedDataset(IterableDataset):
@@ -34,8 +76,10 @@ class StreamingPackedDataset(IterableDataset):
         shuffle_buffer: int = 1000,
     ) -> None:
         super().__init__()
-        if seq_len < 1:
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
             raise ValueError("seq_len must be >= 1")
+        if not isinstance(shuffle_buffer, int) or isinstance(shuffle_buffer, bool) or shuffle_buffer < 1:
+            raise ValueError("shuffle_buffer must be >= 1")
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.sources = (
@@ -44,8 +88,10 @@ class StreamingPackedDataset(IterableDataset):
                 ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
             ]
             if sources is None
-            else sources
+            else validate_hf_sources(sources)
         )
+        if local_texts is not None:
+            validate_sequence_arg(local_texts, "local_texts")
         if local_texts is None and not self.sources:
             raise ValueError("StreamingPackedDataset sources must be non-empty when local_texts is None")
         self.local_texts = (

@@ -2,10 +2,12 @@
 
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from crouton.config import CroutonConfig, TrainConfig
@@ -15,7 +17,9 @@ from crouton.model import CroutonForCausalLM
 from crouton.optim import build_optimizers, wsd_lr_multiplier
 from crouton.tokenizer.train_tokenizer import train_crouton_tokenizer
 from crouton.train.common import (
+    evaluate_model_bpb,
     load_checkpoint,
+    load_checkpoint_payload,
     next_or_restart,
     safe_decode,
     save_checkpoint,
@@ -70,6 +74,8 @@ def test_muon_adamw_step():
 def test_wsd_schedule():
     assert wsd_lr_multiplier(0, total_steps=100, warmup_steps=10, decay_steps=20) == 0.1
     assert wsd_lr_multiplier(50, total_steps=100, warmup_steps=10, decay_steps=20) == 1.0
+    final_step_mult = wsd_lr_multiplier(99, total_steps=100, warmup_steps=10, decay_steps=20, min_lr_ratio=0.1)
+    assert 0.1 < final_step_mult < 0.2
     assert abs(wsd_lr_multiplier(100, total_steps=100, warmup_steps=10, decay_steps=20, min_lr_ratio=0.1) - 0.1) < 1e-6
 
 
@@ -674,14 +680,12 @@ def test_utils_and_cli_edge_cases(tmp_path, monkeypatch):
 
 
 def test_sequence_logps_early_validation_cli_and_eval_guards(tmp_path, monkeypatch):
-    import torch.nn.functional as F
     from crouton.eval import eval_runner as eval_mod
     from crouton.train import dpo as dpo_mod
     from crouton.train import grpo as grpo_mod
     from crouton.train import midtrain as midtrain_mod
     from crouton.train import pretrain as pretrain_mod
     from crouton.train import sft as sft_mod
-    from crouton.train.common import save_checkpoint
     from crouton.train.dpo import sequence_logps
 
     # 1. sequence_logps matches naive fp32 log_softmax+gather across sparse & all-(-100) rows
@@ -791,7 +795,7 @@ def test_sequence_logps_early_validation_cli_and_eval_guards(tmp_path, monkeypat
                 pairs_override=[{"prompt": ["bad"], "chosen": "ok", "rejected": "no"}],
             )
 
-    # 3. Smoke-test both DPO (with reference model reordering) and ORPO end-to-end
+    # 3. Smoke-test both DPO (with frozen reference model) and ORPO end-to-end
     pref_pairs = [{"prompt": "What is 1+1?", "chosen": "2", "rejected": "9"}]
     for use_orpo, name in ((False, "dpo_run"), (True, "orpo_run")):
         out_dir = tmp_path / name
@@ -1020,11 +1024,8 @@ def test_sequence_logps_early_validation_cli_and_eval_guards(tmp_path, monkeypat
 
 
 def test_loop8_validation_and_consistency(tmp_path, monkeypatch) -> None:
-    from pathlib import Path
-
     from crouton.eval import eval_runner as eval_mod, evaluate_lm_eval
     from crouton.train import dpo as dpo_mod, grpo as grpo_mod, midtrain as mid_mod, pretrain as pre_mod, sft as sft_mod
-    from crouton.train.common import load_checkpoint_payload
 
     tok_path = tmp_path / "tok.json"
     tok = train_crouton_tokenizer(
@@ -1338,8 +1339,6 @@ def test_loop8_validation_and_consistency(tmp_path, monkeypatch) -> None:
     )
     assert "<|endoftext|>" not in decoded_no_special and "hello" in decoded_no_special
     bpb_ll = lm.loglikelihood_rolling([SimpleNamespace(args=(raw_special,))])[0]
-    from crouton.train.common import evaluate_model_bpb
-
     shared_bpb = evaluate_model_bpb(lm.model, tok, [raw_special], lm.max_length, lm.device, nullcontext())
     assert pytest.approx(bpb_ll, rel=1e-5, abs=1e-5) == -shared_bpb["loss_nats"] * len(raw_special_ids)
 
@@ -1410,3 +1409,75 @@ def test_loop8_validation_and_consistency(tmp_path, monkeypatch) -> None:
     )
     _, dpo_cfg, _ = load_checkpoint_payload(dpo_preserve_dir / "final.pt")
     assert dpo_cfg.max_seq_len == 32
+
+    # Loop 11 regressions: checkpoint missing keys, save_checkpoint, evaluate_model_bpb, pretrain/midtrain/GRPO/RoPE warnings
+    bad_missing_ckpt = tmp_path / "missing_cfg.pt"
+    incomplete_cfg = {k: v for k, v in raw_payload["config"].items() if k != "d_model"}
+    torch.save({"config": incomplete_cfg, "model": raw_payload["model"]}, bad_missing_ckpt)
+    with pytest.raises(ValueError, match="missing required"):
+        load_checkpoint_payload(bad_missing_ckpt)
+
+    occupied_dir = tmp_path / "occupied_dir"
+    occupied_dir.mkdir()
+    with pytest.raises(ValueError, match="directory"):
+        save_checkpoint(occupied_dir, lm.model, cfg, step=0)
+    with pytest.raises(ValueError, match="non-empty"):
+        save_checkpoint("   ", lm.model, cfg, step=0)
+
+    for bad_eval_texts in ("bare_string", (t for t in ["hi"])):
+        with pytest.raises(ValueError, match="list or tuple"):
+            evaluate_model_bpb(lm.model, tok, bad_eval_texts, lm.max_length, lm.device, nullcontext())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="max_seq_len"):
+        run_pretrain(
+            cfg,
+            TrainConfig(output_dir=str(tmp_path / "pre_seq_over"), tokenizer_path=str(tok_path), seq_len=cfg.max_seq_len + 1),
+        )
+
+    bad_yaml_cli = tmp_path / "bad_cli.yaml"
+    bad_yaml_cli.write_text("d_model: [unclosed\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-pretrain", "--model-config", str(bad_yaml_cli), "--output-dir", str(tmp_path / "pre_bad_yaml"), "--tokenizer", str(tok_path)],
+    )
+    with pytest.raises(SystemExit):
+        pre_mod.main()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["crouton-midtrain", "--base-checkpoint", str(ckpt_ok), "--local-file", str(val_file), "--split", "   "],
+    )
+    with pytest.raises(SystemExit):
+        mid_mod.main()
+
+    prefill_ids = grpo_mod._encode_grpo_prompt(
+        tok,
+        "<|im_start|>system\nRules.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\nAnswer<|im_end|>",
+    )
+    assert prefill_ids.count(im_start_id) == 3
+    assert prefill_ids.count(im_end_id) == 2
+
+    with pytest.raises(ValueError, match="max_seq_len"):
+        grpo_mod._gather_completion_logps(lm.model, torch.tensor([[1, 2, 3]]), prompt_len=1, max_seq_len=0)
+    with pytest.raises(ValueError, match="prompt_len"):
+        grpo_mod._gather_completion_logps(lm.model, torch.tensor([[1, 2, 3]]), prompt_len=0, max_seq_len=8)
+    with pytest.raises(ValueError, match="T > prompt_len"):
+        grpo_mod._gather_completion_logps(lm.model, torch.tensor([[1, 2]]), prompt_len=2, max_seq_len=8)
+
+    with pytest.raises(ValueError, match="integer token IDs"):
+        lm.tokenizer.decode(123)  # type: ignore[arg-type]
+
+    with pytest.warns(UserWarning, match="unscaled RoPE extrapolation"):
+        run_sft(
+            str(ckpt_ok),
+            str(tok_path),
+            str(tmp_path / "sft_extrap_warn"),
+            seq_len=cfg.max_seq_len + 8,
+            total_steps=1,
+            micro_batch_size=1,
+            grad_accum_steps=1,
+            bf16=False,
+            examples_override=[[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"}]],
+        )

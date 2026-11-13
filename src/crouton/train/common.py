@@ -7,13 +7,18 @@ import math
 import os
 from pathlib import Path
 from typing import Any, TypeVar
+import warnings
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from crouton.config import CroutonConfig
-from crouton.data.pretrain_data import resolve_token_id
+from crouton.config import CroutonConfig, REQUIRED_CONFIG_KEYS
+from crouton.data.pretrain_data import (
+    normalize_optional_subset,
+    resolve_token_id,
+    validate_sequence_arg,
+)
 from crouton.model import CroutonForCausalLM
 
 _T = TypeVar("_T")
@@ -31,20 +36,21 @@ def safe_decode(tokenizer, token_ids: list[int]) -> str:
     return tokenizer.decode(filtered)
 
 
-def normalize_optional_subset(subset: str | None) -> str | None:
-    """Normalize optional HF subset names so blank or 'none' markers map cleanly to None."""
-    if subset is None:
-        return None
-    if not isinstance(subset, str):
-        raise ValueError("subset must be a string when specified")
-    cleaned = subset.strip()
-    return None if cleaned in ("", "none", "None") else cleaned
+def compute_flex_pad_multiple(device: torch.device, model_cfg: CroutonConfig) -> int:
+    """Return block-alignment multiple for CUDA SM80+ FlexAttention batches."""
+    return 128 if (device.type == "cuda" and model_cfg.use_flex_attention and torch.cuda.get_device_capability(device)[0] >= 8) else 1
 
 
-def validate_sequence_arg(value: Any, name: str) -> None:
-    """Require a list or tuple sequence container (rejecting bare strings, bytes, and single-use iterators)."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{name} must be a list or tuple")
+def warn_unscaled_rope_extension(model_cfg: CroutonConfig, seq_len: int) -> None:
+    """Warn when post-training expands max_seq_len beyond rope_original_max_seq_len without RoPE scaling."""
+    if seq_len > model_cfg.rope_original_max_seq_len and model_cfg.rope_scale_factor <= 1.0:
+        warnings.warn(
+            f"seq_len ({seq_len}) exceeds rope_original_max_seq_len ({model_cfg.rope_original_max_seq_len}) "
+            f"while rope_scale_factor={model_cfg.rope_scale_factor}; unscaled RoPE extrapolation may degrade "
+            f"long-context quality without midtrain context extension.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def looks_like_dir_path(raw_path: str) -> bool:
@@ -162,6 +168,9 @@ def evaluate_model_bpb(
     """
     if seq_len < 1:
         raise ValueError(f"seq_len ({seq_len}) must be >= 1")
+    validate_sequence_arg(texts, "Evaluation texts")
+    if not texts or not all(isinstance(t, str) for t in texts) or not any(t.strip() for t in texts):
+        raise ValueError("Evaluation texts must contain at least one non-empty string")
     raw_model = unwrap_model(model)
     was_training = raw_model.training
     raw_model.eval()
@@ -222,7 +231,16 @@ def save_checkpoint(
     step: int,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    out = Path(path)
+    if isinstance(path, str):
+        (clean_path,) = strip_required_paths(checkpoint_path=path)
+        out = Path(clean_path)
+    elif isinstance(path, Path) and str(path).strip():
+        out = path
+    else:
+        raise ValueError("checkpoint_path must be non-empty")
+    if out.is_dir() or (out.is_symlink() and not out.exists()):
+        raise ValueError(f"Checkpoint output path {str(out)!r} must be a file path, not a directory")
+    validate_output_dir(out.parent)
     out.parent.mkdir(parents=True, exist_ok=True)
     raw_model = unwrap_model(model)
     payload: dict[str, Any] = {
@@ -258,6 +276,11 @@ def load_checkpoint_payload(
         raise ValueError(f"Checkpoint {ckpt_path!r} is missing a valid 'config' dict")
     if not isinstance(raw_model, dict) or not raw_model or not all(isinstance(k, str) for k in raw_model):
         raise ValueError(f"Checkpoint {ckpt_path!r} is missing a valid 'model' state_dict")
+    missing_cfg = [k for k in REQUIRED_CONFIG_KEYS if k not in raw_cfg]
+    if missing_cfg:
+        raise ValueError(
+            f"Checkpoint {ckpt_path!r} CroutonConfig is missing required key(s): {', '.join(missing_cfg)}"
+        )
     cfg_dict = dict(raw_cfg)
     if "rope_original_max_seq_len" not in cfg_dict:
         cfg_dict["rope_original_max_seq_len"] = cfg_dict.get("max_seq_len", 2048)

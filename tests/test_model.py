@@ -1,11 +1,13 @@
 """Tests for Crouton model architecture, YaRN/NTK RoPE, attention_mask, generate(), and configs."""
 
+import math
+
 import pytest
 import torch
 
 from crouton.config import CroutonConfig, TrainConfig
-from crouton.model import CroutonForCausalLM, HybridSparseAttention, build_swa_sink_mask
-from crouton.model.rope import apply_rope
+from crouton.model import CroutonForCausalLM, HybridSparseAttention, MergedLoRADenseMoE, build_swa_sink_mask
+from crouton.model.rope import RotaryEmbedding, apply_rope
 
 
 def test_swa_sink_mask_properties():
@@ -182,8 +184,9 @@ def test_model_config_validation_and_optional_flags(tmp_path):
 
     model.train()
     x = torch.randint(0, 128, (2, 9))
-    non_contig_targets = x[:, 1:].clone()
-    out = model(x[:, :-1], targets=non_contig_targets)
+    raw_targets = x[:, 1:]
+    assert not raw_targets.is_contiguous()
+    out = model(x[:, :-1], targets=raw_targets)
     assert out.logits.abs().max().item() <= 30.0 + 1e-4
     assert out.router_entropy is not None and not out.router_entropy.requires_grad
     out.loss.backward()
@@ -296,3 +299,80 @@ def test_model_config_validation_and_optional_flags(tmp_path):
         assert gen_eos[1].tolist() == [1, 2, 9]
     finally:
         m_ce.forward = orig_forward  # type: ignore[method-assign]
+
+    # Config type/YAML validation, generate() bounds, MoE scaling, YaRN formula, and compiled sparse-CE parity
+    for bad_typed in (
+        {"vocab_size": True},
+        {"vocab_size": 32.5},
+        {"tie_embeddings": "false"},
+        {"norm_eps": None},
+    ):
+        with pytest.raises(ValueError):
+            CroutonConfig(**bad_typed)  # type: ignore[arg-type]
+    for bad_tcfg in ({"total_steps": True}, {"bf16": "true"}, {"muon_lr": None}):
+        with pytest.raises(ValueError):
+            TrainConfig(**bad_tcfg)  # type: ignore[arg-type]
+
+    malformed_yaml = tmp_path / "malformed.yaml"
+    malformed_yaml.write_text("d_model: [1, 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid YAML"):
+        CroutonConfig.from_yaml(malformed_yaml)
+
+    partial_yaml = tmp_path / "partial.yaml"
+    partial_yaml.write_text("d_model: 64\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Missing required CroutonConfig keys"):
+        CroutonConfig.from_yaml(partial_yaml)
+
+    omitted_orig_yaml = tmp_path / "omitted_orig.yaml"
+    omitted_orig_yaml.write_text(
+        "vocab_size: 64\nd_model: 32\nn_layers: 2\nn_heads: 4\nn_kv_heads: 2\nd_ff: 64\nn_experts: 2\nexpert_rank: 4\nmax_seq_len: 1024\n",
+        encoding="utf-8",
+    )
+    assert CroutonConfig.from_yaml(omitted_orig_yaml).rope_original_max_seq_len == 1024
+
+    for bad_gen in (
+        (torch.tensor([1, 2]), {}),
+        (torch.zeros((0, 2), dtype=torch.long), {}),
+        (torch.tensor([[1, 2]]), {"max_new_tokens": -1}),
+        (torch.tensor([[1, 2]]), {"vocab_limit": 0}),
+    ):
+        with pytest.raises(ValueError):
+            m_ce.generate(bad_gen[0], **bad_gen[1])
+
+    # Direct MergedLoRADenseMoE scale=alpha/rank & gradient flow once down_B/up_B are non-zero
+    moe = MergedLoRADenseMoE(CroutonConfig(vocab_size=32, d_model=16, n_layers=1, n_heads=4, n_kv_heads=2, d_ff=32, n_experts=2, expert_rank=4, expert_alpha=8.0, use_flex_attention=False))
+    assert moe.scale == 2.0
+    with torch.no_grad():
+        moe.up_B.fill_(0.05)
+        moe.down_B.fill_(0.05)
+    moe_x = torch.randn(2, 5, 16, requires_grad=True)
+    moe_out, _ = moe(moe_x)
+    moe_out.sum().backward()
+    assert moe.router.weight.grad is not None and moe.router.weight.grad.abs().sum().item() > 0.0
+    assert moe.up_A.grad is not None and moe.up_A.grad.abs().sum().item() > 0.0
+
+    # Exact YaRN mscale and high/low-frequency inv_freq ramp check
+    rope_yarn = RotaryEmbedding(
+        head_dim=8,
+        max_seq_len=32,
+        theta=10000.0,
+        scale_factor=2.0,
+        scaling_type="yarn",
+        original_max_seq_len=16,
+    )
+    expected_mscale = 0.1 * math.log(2.0) + 1.0
+    assert abs(rope_yarn.mscale - expected_mscale) < 1e-6
+    assert abs(float(rope_yarn.inv_freq[0]) - 1.0) < 1e-6
+    expected_low = (1.0 / (10000.0 ** (6.0 / 8.0))) / 2.0
+    assert abs(float(rope_yarn.inv_freq[-1]) - expected_low) < 1e-6
+
+    # Runtime verification of torch.compiler.is_compiling() sparse-CE and mask branches on CPU
+    m_ce.eval()
+    compiled_ce = torch.compile(m_ce, backend="aot_eager")
+    pad_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=torch.bool)
+    with torch.no_grad():
+        eager_out = m_ce(ce_x, attention_mask=pad_mask, targets=ce_tgt)
+        comp_out = compiled_ce(ce_x, attention_mask=pad_mask, targets=ce_tgt)
+    assert torch.allclose(comp_out.logits[:, :2], eager_out.logits[:, :2], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(comp_out.loss, eager_out.loss, atol=1e-5, rtol=1e-5)
+    assert compiled_ce(ce_x, attention_mask=pad_mask, targets=all_masked).loss.item() == 0.0

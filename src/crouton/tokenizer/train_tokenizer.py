@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 import math
 from pathlib import Path
 
 from tokenisers import WpBpePpigTokenizer
 
+from crouton.data.pretrain_data import validate_hf_sources
 from crouton.tokenizer.pretokenizer import DEFAULT_SPECIAL_TOKENS, build_crouton_pretokenizer
-from crouton.train.common import looks_like_dir_path, normalize_optional_subset, validate_sequence_arg
+from crouton.train.common import (
+    looks_like_dir_path,
+    normalize_optional_subset,
+    strip_required_paths,
+    validate_output_dir,
+)
 
 
 DEFAULT_TOKENIZER_SOURCES = [
@@ -23,15 +30,15 @@ def iter_hf_corpus(
     sources: list[tuple[str, str | None, str, str]],
     max_docs: int,
 ) -> list[str]:
-    validate_sequence_arg(sources, "sources")
-    if not sources:
+    validated_sources = validate_hf_sources(sources)
+    if not validated_sources:
         raise ValueError("sources must be non-empty")
-    if max_docs < 1:
+    if not isinstance(max_docs, int) or isinstance(max_docs, bool) or max_docs < 1:
         raise ValueError(f"max_docs ({max_docs}) must be >= 1")
     from datasets import load_dataset
 
-    iters = [iter(load_dataset(name, subset, split=split, streaming=True)) for name, subset, split, _ in sources]
-    fields = [field for _, _, _, field in sources]
+    iters = [iter(load_dataset(name, subset, split=split, streaming=True)) for name, subset, split, _ in validated_sources]
+    fields = [field for _, _, _, field in validated_sources]
 
     texts: list[str] = []
     idx = 0
@@ -61,17 +68,20 @@ def _validate_tokenizer_output_path(output_path: str | Path) -> Path:
     out_str = str(output_path).strip() if isinstance(output_path, (str, Path)) else ""
     if not out_str:
         raise ValueError("output_path must be non-empty")
+    raw_parts = [p for p in out_str.replace("\\", "/").split("/") if p]
+    has_json_traversal = len(raw_parts) >= 2 and raw_parts[-1] in (".", "..") and raw_parts[-2].endswith(".json")
     out = Path(out_str)
-    for parent in out.parents:
-        if (parent.exists() and not parent.is_dir()) or (parent.is_symlink() and not parent.exists()):
-            raise ValueError(f"Tokenizer output parent path {str(parent)!r} exists and is not a directory")
-    if out.suffix == ".json":
-        if (isinstance(output_path, str) and looks_like_dir_path(out_str)) or out.is_dir() or (
-            out.is_symlink() and not out.exists()
+    if out.suffix == ".json" or has_json_traversal:
+        if (
+            (isinstance(output_path, str) and looks_like_dir_path(out_str))
+            or has_json_traversal
+            or out.is_dir()
+            or (out.is_symlink() and not out.exists())
         ):
             raise ValueError(f"Tokenizer JSON output path {out_str!r} must be a file path, not a directory")
-    elif (out.exists() and not out.is_dir()) or (out.is_symlink() and not out.exists()):
-        raise ValueError(f"Tokenizer output directory {out_str!r} exists and is not a directory")
+        validate_output_dir(out.parent)
+    else:
+        validate_output_dir(out)
     return out
 
 
@@ -86,8 +96,14 @@ def train_crouton_tokenizer(
     """Train WpBpePpigTokenizer with crouton pretokenizer and export to `output_path`."""
     out = _validate_tokenizer_output_path(output_path)
     if (
-        vocab_size < MIN_VOCAB_SIZE
+        not isinstance(vocab_size, int)
+        or isinstance(vocab_size, bool)
+        or vocab_size < MIN_VOCAB_SIZE
+        or not isinstance(min_frequency, int)
+        or isinstance(min_frequency, bool)
         or min_frequency < 1
+        or not isinstance(length_penalty, (int, float))
+        or isinstance(length_penalty, bool)
         or not math.isfinite(length_penalty)
         or length_penalty < 0.0
     ):
@@ -96,8 +112,10 @@ def train_crouton_tokenizer(
         )
     if isinstance(corpus, str):
         corpus = [line for line in corpus.splitlines() if line.strip()] or ([corpus] if corpus.strip() else [])
-    else:
+    elif isinstance(corpus, Iterable):
         corpus = [t for t in corpus if isinstance(t, str) and t.strip()]
+    else:
+        raise ValueError("corpus must be a string or an iterable of strings")
     if not corpus:
         raise ValueError("Training corpus must contain at least one non-empty document")
 
@@ -133,10 +151,8 @@ def main() -> None:
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--max-docs", type=int, default=50000)
     args = parser.parse_args()
-    output_path = args.output.strip()
-    if not output_path:
-        parser.error("--output must be non-empty")
     try:
+        (output_path,) = strip_required_paths(**{"--output": args.output})
         _validate_tokenizer_output_path(output_path)
     except ValueError as exc:
         parser.error(str(exc))
@@ -169,7 +185,7 @@ def main() -> None:
 
     if local_file is not None:
         corpus = read_local_corpus(local_file)
-        if not corpus or not any(line.strip() for line in corpus):
+        if not corpus:
             raise ValueError(f"Local tokenizer corpus {local_file!r} contains no non-empty text")
     elif args.dataset is not None:
         subset = normalize_optional_subset(args.subset)

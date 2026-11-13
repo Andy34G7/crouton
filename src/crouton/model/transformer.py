@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -208,20 +209,29 @@ class CroutonForCausalLM(nn.Module):
         max_new_tokens: int = 128,
         temperature: float = 0.0,
         top_k: int = 0,
-        eos_token_ids: set[int] | list[int] | None = None,
+        eos_token_ids: Sequence[int] | set[int] | None = None,
         vocab_limit: int | None = None,
     ) -> torch.Tensor:
         """Autoregressive generation with fp32 sampling, top-k filtering, and EOS stopping."""
-        if input_ids.size(1) < 1:
-            raise ValueError("input_ids must have seq_len >= 1")
-        if vocab_limit is not None and vocab_limit < 1:
+        if input_ids.ndim != 2 or input_ids.size(0) < 1 or input_ids.size(1) < 1:
+            raise ValueError("input_ids must be 2D [B, T] with B >= 1 and T >= 1")
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) or max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a non-negative integer")
+        if vocab_limit is not None and (
+            not isinstance(vocab_limit, int) or isinstance(vocab_limit, bool) or vocab_limit < 1
+        ):
             raise ValueError("vocab_limit must be >= 1 when specified")
         was_training = self.training
         self.eval()
         try:
+            ordered_eos = (
+                sorted({int(t) for t in eos_token_ids})
+                if isinstance(eos_token_ids, set)
+                else list(dict.fromkeys(int(t) for t in eos_token_ids))
+            ) if eos_token_ids else []
             eos_tensor = (
-                torch.tensor(list(dict.fromkeys(int(t) for t in eos_token_ids)), dtype=torch.long, device=input_ids.device)
-                if eos_token_ids
+                torch.tensor(ordered_eos, dtype=torch.long, device=input_ids.device)
+                if ordered_eos
                 else None
             )
             eos_fill = eos_tensor[:1].view(1, 1) if eos_tensor is not None else None

@@ -160,6 +160,14 @@ def _gather_completion_logps(
     vocab_limit: int | None = None,
 ) -> torch.Tensor:
     """Return per-token log-probabilities [min(T_gen, max_seq_len)] for generated tokens seq[0, prompt_len:], clipped to max_seq_len."""
+    if not isinstance(max_seq_len, int) or isinstance(max_seq_len, bool) or max_seq_len < 1:
+        raise ValueError("max_seq_len must be >= 1")
+    if not isinstance(prompt_len, int) or isinstance(prompt_len, bool) or prompt_len < 1:
+        raise ValueError("prompt_len must be >= 1")
+    if seq.ndim != 2 or seq.size(1) <= prompt_len:
+        raise ValueError("seq must be 2D [B, T] with T > prompt_len")
+    if vocab_limit is not None and (not isinstance(vocab_limit, int) or isinstance(vocab_limit, bool) or vocab_limit < 1):
+        raise ValueError("vocab_limit must be >= 1 when specified")
     inp = seq[:, :-1]
     tgt = seq[:, prompt_len:]
     if inp.size(1) > max_seq_len:
@@ -170,8 +178,6 @@ def _gather_completion_logps(
         start_logit = prompt_len - 1
     logits = model(inp).logits[:, start_logit:, :].float()
     if vocab_limit is not None:
-        if vocab_limit < 1:
-            raise ValueError("vocab_limit must be >= 1 when specified")
         logits = logits[..., :vocab_limit]
     tgt = tgt[:, -logits.size(1) :]
     log_probs = F.log_softmax(logits, dim=-1)
@@ -206,7 +212,7 @@ _CHATML_TURN_RE = re.compile(
     r"<\|im_start\|>([A-Za-z0-9_-]+)\n(.*?)<\|im_end\|>\n(?=<\|im_start\|>[A-Za-z0-9_-]+\n|$)",
     re.DOTALL,
 )
-_CHATML_OPEN_TURN_RE = re.compile(r"<\|im_start\|>([A-Za-z0-9_-]+)\n$")
+_CHATML_OPEN_TURN_RE = re.compile(r"<\|im_start\|>([A-Za-z0-9_-]+)\n")
 
 
 def _encode_grpo_prompt(tokenizer: WpBpePpigTokenizer, prompt: str) -> list[int]:
@@ -224,11 +230,13 @@ def _encode_grpo_prompt(tokenizer: WpBpePpigTokenizer, prompt: str) -> list[int]
     if pos == len(prompt) and pos > 0:
         return ids
 
-    tail_match = _CHATML_OPEN_TURN_RE.fullmatch(prompt, pos)
+    tail_match = _CHATML_OPEN_TURN_RE.match(prompt, pos)
     if tail_match is not None:
         role = tail_match.group(1)
         ids.extend(tokenizer.encode("<|im_start|>"))
         ids.extend(tokenizer.encode(f"{role}\n", split_special_tokens=True))
+        if tail_match.end() < len(prompt):
+            ids.extend(tokenizer.encode(prompt[tail_match.end() :], split_special_tokens=True))
         return ids
 
     return list(tokenizer.encode(prompt, split_special_tokens=True))

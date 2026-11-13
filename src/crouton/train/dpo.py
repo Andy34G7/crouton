@@ -20,6 +20,7 @@ from crouton.data import PreferenceDataset, collate_preference_batch, is_valid_p
 from crouton.optim import build_adamw_param_groups, set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import (
     bf16_supported,
+    compute_flex_pad_multiple,
     get_device,
     instantiate_checkpoint_model,
     load_checkpoint_payload,
@@ -30,6 +31,7 @@ from crouton.train.common import (
     validate_output_dir,
     validate_sequence_arg,
     validate_tokenizer_vocab,
+    warn_unscaled_rope_extension,
 )
 
 
@@ -161,6 +163,7 @@ def run_preference_tuning(
 
     ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint)
     if seq_len > model_cfg.max_seq_len:
+        warn_unscaled_rope_extension(model_cfg, seq_len)
         model_cfg.max_seq_len = seq_len
         model_cfg.__post_init__()
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
@@ -200,7 +203,7 @@ def run_preference_tuning(
         for p in ref_model.parameters():
             p.requires_grad = False
 
-    pad_mult = 128 if (device.type == "cuda" and model_cfg.use_flex_attention and torch.cuda.get_device_capability(device)[0] >= 8) else 1
+    pad_mult = compute_flex_pad_multiple(device, model_cfg)
     loader = DataLoader(
         ds,
         batch_size=micro_batch_size,

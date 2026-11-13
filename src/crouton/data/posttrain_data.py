@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
-from crouton.data.pretrain_data import resolve_token_id
+from crouton.data.pretrain_data import resolve_pad_token_id, validate_sequence_arg
 
 
 def is_chatml_messages(messages: Any) -> bool:
@@ -41,7 +41,7 @@ def is_valid_preference_pair(item: Any) -> bool:
 
 
 def _encode_chatml_messages(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, str | None]],
     tokenizer,
     mask_earlier_assistant_turns: bool = False,
 ) -> tuple[list[int], list[int]]:
@@ -122,11 +122,12 @@ def _truncate_keep_supervision(
 
 
 def format_chatml_sft_with_mask(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, str | None]],
     tokenizer,
     seq_len: int,
     mask_earlier_assistant_turns: bool = False,
     pad_to_max: bool = True,
+    pad_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Encode a multi-turn conversation in ChatML format with assistant-only loss masking.
@@ -134,12 +135,16 @@ def format_chatml_sft_with_mask(
     (left-truncating long prompts) so targets never collapse to all -100 when avoidable.
     Returns (input_ids, targets, attention_mask) each of shape [seq_len] when pad_to_max=True.
     """
-    if seq_len < 1:
+    if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
         raise ValueError("seq_len must be >= 1")
-    pad_id = resolve_token_id(tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0))
-    input_ids, targets = _encode_chatml_messages(messages, tokenizer, mask_earlier_assistant_turns)
+    validate_sequence_arg(messages, "messages")
+    msg_list = list(messages)
+    if not is_chatml_messages(msg_list):
+        raise ValueError("messages must be a non-empty list of ChatML {'role', 'content'} dicts")
+    resolved_pad_id = resolve_pad_token_id(tokenizer) if pad_id is None else pad_id
+    input_ids, targets = _encode_chatml_messages(msg_list, tokenizer, mask_earlier_assistant_turns)
     input_ids, targets = _truncate_keep_supervision(input_ids, targets, seq_len + 1)
-    return _pad_and_shift(input_ids, targets, seq_len, pad_id, pad_to_max=pad_to_max)
+    return _pad_and_shift(input_ids, targets, seq_len, resolved_pad_id, pad_to_max=pad_to_max)
 
 
 def collate_sft_batch(
@@ -149,9 +154,16 @@ def collate_sft_batch(
     max_seq_len: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Right-pad SFT samples to batch max (optionally block-aligned for FlexAttention)."""
+    validate_sequence_arg(batch, "batch")
     if not batch:
         raise ValueError("Cannot collate empty SFT batch")
+    if not isinstance(pad_to_multiple, int) or isinstance(pad_to_multiple, bool) or pad_to_multiple < 1:
+        raise ValueError("pad_to_multiple must be >= 1")
     max_len = max(1, *(int(x.size(0)) for x, _, _ in batch))
+    if max_seq_len is not None and (
+        not isinstance(max_seq_len, int) or isinstance(max_seq_len, bool) or max_seq_len < max_len
+    ):
+        raise ValueError(f"max_seq_len ({max_seq_len}) must be >= batch max length ({max_len})")
     target_len = max_len
     if pad_to_multiple > 1 and max_len >= pad_to_multiple:
         target_len = ((max_len + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
@@ -183,6 +195,7 @@ def collate_preference_batch(
     max_seq_len: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Right-pad chosen and rejected pairs independently to batch-max lengths."""
+    validate_sequence_arg(batch, "batch")
     if not batch:
         raise ValueError("Cannot collate empty preference batch")
     c_x, c_y, c_m = collate_sft_batch(
@@ -212,20 +225,19 @@ class SFTDataset(Dataset):
 
     def __init__(
         self,
-        examples: list[list[dict[str, str]]],
+        examples: list[list[dict[str, str | None]]],
         tokenizer,
         seq_len: int,
         pad_to_max: bool = True,
     ) -> None:
-        if seq_len < 1:
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
             raise ValueError("seq_len must be >= 1")
+        validate_sequence_arg(examples, "examples")
         self.examples = examples
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.pad_to_max = pad_to_max
-        self.pad_id = resolve_token_id(
-            tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
-        )
+        self.pad_id = resolve_pad_token_id(tokenizer)
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -236,6 +248,7 @@ class SFTDataset(Dataset):
             self.tokenizer,
             self.seq_len,
             pad_to_max=self.pad_to_max,
+            pad_id=self.pad_id,
         )
 
 
@@ -249,21 +262,23 @@ class PreferenceDataset(Dataset):
         seq_len: int,
         pad_to_max: bool = True,
     ) -> None:
-        if seq_len < 1:
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
             raise ValueError("seq_len must be >= 1")
+        validate_sequence_arg(pairs, "pairs")
         self.pairs = pairs
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.pad_to_max = pad_to_max
-        self.pad_id = resolve_token_id(
-            tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
-        )
+        self.pad_id = resolve_pad_token_id(tokenizer)
 
     def __len__(self) -> int:
         return len(self.pairs)
 
     @staticmethod
-    def _to_messages(prompt: str | list[dict[str, str]], response: str | list[dict[str, str]]) -> list[dict[str, str]]:
+    def _to_messages(
+        prompt: str | list[dict[str, str | None]] | None,
+        response: str | list[dict[str, str | None]] | None,
+    ) -> list[dict[str, str | None]]:
         if prompt is not None and not isinstance(prompt, (str, list)):
             raise ValueError("Preference prompt must be a string, None, or non-empty ChatML message list")
         if response is not None and not isinstance(response, (str, list)):
@@ -301,6 +316,7 @@ class PreferenceDataset(Dataset):
                 self.seq_len,
                 mask_earlier_assistant_turns=True,
                 pad_to_max=self.pad_to_max,
+                pad_id=self.pad_id,
             )
             r_x, r_y, r_mask = c_x.clone(), c_y.clone(), c_mask.clone()
         elif common_k == 0:
@@ -311,6 +327,7 @@ class PreferenceDataset(Dataset):
                 self.seq_len,
                 mask_earlier_assistant_turns=True,
                 pad_to_max=self.pad_to_max,
+                pad_id=self.pad_id,
             )
             r_x, r_y, r_mask = format_chatml_sft_with_mask(
                 r_msgs,
@@ -318,6 +335,7 @@ class PreferenceDataset(Dataset):
                 self.seq_len,
                 mask_earlier_assistant_turns=True,
                 pad_to_max=self.pad_to_max,
+                pad_id=self.pad_id,
             )
         else:
             shared_ids, _ = _encode_chatml_messages(c_msgs[:common_k], self.tokenizer, mask_earlier_assistant_turns=True)

@@ -151,7 +151,7 @@ def run_midtrain(
     model = instantiate_checkpoint_model(ckpt, model_cfg, device)
 
     sources = (
-        [(dataset_name.strip(), subset, split.strip(), text_field.strip())]
+        [(dataset_name, subset, split, text_field)]
         if dataset_name is not None
         else [
             ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
@@ -243,6 +243,8 @@ def main() -> None:
         parser.error(str(exc))
     split = args.split.strip()
     text_field = args.text_field.strip()
+    if not split or not text_field:
+        parser.error("--split and --text-field must be non-empty")
     local_file = args.local_file.strip() if args.local_file is not None else None
     if local_file is not None:
         if not local_file:
