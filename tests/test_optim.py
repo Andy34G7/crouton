@@ -2,7 +2,9 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from crouton.config import CroutonConfig, TrainConfig
 from crouton.data import StreamingPackedDataset, format_chatml_sft_with_mask
@@ -10,7 +12,7 @@ from crouton.eval import CroutonLM, evaluate_bpb
 from crouton.model import CroutonForCausalLM
 from crouton.optim import build_optimizers, wsd_lr_multiplier
 from crouton.tokenizer.train_tokenizer import train_crouton_tokenizer
-from crouton.train.common import load_checkpoint, strip_orig_mod_prefix
+from crouton.train.common import load_checkpoint, next_or_restart, strip_orig_mod_prefix, validate_tokenizer_vocab
 from crouton.train.dpo import dpo_loss, orpo_loss, run_preference_tuning
 from crouton.train.grpo import (
     _gather_completion_logps,
@@ -112,9 +114,53 @@ def test_build_optimizers_handles_orig_mod_wrapper():
             super().__init__()
             self._orig_mod = mod
 
-    wrapped = _OrigModWrapper(CroutonForCausalLM(_tiny_cfg()))
+    class _DDPWrapper(torch.nn.Module):
+        def __init__(self, mod):
+            super().__init__()
+            self.module = mod
+
+    wrapped = _DDPWrapper(_OrigModWrapper(CroutonForCausalLM(_tiny_cfg())))
     muon_opt, _ = build_optimizers(wrapped)
     assert len(muon_opt.param_groups[0]["params"]) > 0
+
+
+def test_next_or_restart_and_empty_dataset_guards(tmp_path):
+    # Finite loader wraps cleanly on exhaustion
+    dl = DataLoader([torch.tensor([1]), torch.tensor([2])], batch_size=1)
+    it = iter(dl)
+    vals = []
+    for _ in range(5):
+        v, it = next_or_restart(it, dl)
+        vals.append(int(v.item()))
+    assert vals == [1, 2, 1, 2, 1]
+
+    empty_dl = DataLoader([], batch_size=1)
+    with pytest.raises(RuntimeError, match="zero batches"):
+        next_or_restart(iter(empty_dl), empty_dl)
+
+    with pytest.raises(ValueError, match="vocab_size"):
+        validate_tokenizer_vocab(SimpleNamespace(vocab_size=999), _tiny_cfg())
+
+    # Finite short local_file runs without StopIteration even if steps > distinct packed chunks
+    tok_path = tmp_path / "tok.json"
+    train_crouton_tokenizer(["hello world foo bar baz"] * 3, output_path=tok_path, vocab_size=300)
+    short_file = tmp_path / "short.txt"
+    short_file.write_text("hello world foo bar baz " * 4, encoding="utf-8")
+    cfg = _tiny_cfg()
+    tcfg = TrainConfig(
+        output_dir=str(tmp_path / "pre_short"),
+        tokenizer_path=str(tok_path),
+        seq_len=8,
+        micro_batch_size=1,
+        grad_accum_steps=1,
+        total_steps=5,
+        warmup_steps=1,
+        decay_steps=1,
+        compile_model=False,
+        bf16=False,
+    )
+    run_pretrain(cfg, tcfg, local_file=str(short_file))
+    assert (tmp_path / "pre_short" / "final.pt").exists()
 
 
 def test_streaming_dataset_terminates_on_exhaustion(tmp_path):
@@ -232,6 +278,25 @@ def test_end_to_end_pipeline_and_eval_smoke(tmp_path):
     orpo_ckpt = orpo_dir / "final.pt"
     assert orpo_ckpt.exists()
 
+    dpo_dir = tmp_path / "dpo"
+    run_preference_tuning(
+        base_checkpoint=str(sft_ckpt),
+        tokenizer_path=str(tok_path),
+        output_dir=str(dpo_dir),
+        seq_len=32,
+        total_steps=1,
+        micro_batch_size=1,
+        grad_accum_steps=1,
+        use_orpo=False,
+        pairs_override=[{"prompt": "Hi", "chosen": "Hello!", "rejected": "Bye"}] * 2,
+    )
+    assert (dpo_dir / "final.pt").exists()
+
+    with pytest.raises(ValueError, match="zero valid"):
+        run_sft(str(mid_ckpt), str(tok_path), str(tmp_path / "bad_sft"), examples_override=[])
+    with pytest.raises(ValueError, match="zero valid"):
+        run_preference_tuning(str(sft_ckpt), str(tok_path), str(tmp_path / "bad_dpo"), pairs_override=[])
+
     grpo_dir = tmp_path / "grpo"
     run_grpo(
         base_checkpoint=str(orpo_ckpt),
@@ -245,12 +310,21 @@ def test_end_to_end_pipeline_and_eval_smoke(tmp_path):
     grpo_ckpt = grpo_dir / "final.pt"
     assert grpo_ckpt.exists()
 
-    bpb_metrics = evaluate_bpb(str(grpo_ckpt), str(tok_path), corpus[:3], seq_len=32)
+    bpb_metrics = evaluate_bpb(str(grpo_ckpt), str(tok_path), corpus[:3])
     assert bpb_metrics["bpb"] > 0.0
 
     lm = CroutonLM(str(grpo_ckpt), str(tok_path), device="cpu")
     ll_res = lm.loglikelihood([SimpleNamespace(args=("Hi", " Hello!"))])
+    ll_trailing = lm.loglikelihood([SimpleNamespace(args=("Hi ", "Hello!"))])
     assert len(ll_res) == 1 and isinstance(ll_res[0][0], float)
+    assert ll_res[0] == ll_trailing[0]
+
+    # Verify CroutonLM never triggers read-only @property device setters on LM bases
+    assert isinstance(type(lm).device, property)
+    assert lm.device == torch.device("cpu")
+    with pytest.raises(AttributeError):
+        lm.device = torch.device("cpu")  # type: ignore[misc]
+
     long_text = "Dense MoE with ReLU^2 and sparse attention. " * 20
     roll_res = lm.loglikelihood_rolling([SimpleNamespace(args=(long_text,))])
     assert len(roll_res) == 1 and isinstance(roll_res[0], float) and roll_res[0] < 0.0

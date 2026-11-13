@@ -1,5 +1,6 @@
 """Tests for wp-bpe-ppig pretokenizer rules, JSON/dir export, ChatML SFT masking, and multi-turn prefs."""
 
+import torch
 from tokenisers import WpBpePpigTokenizer, _core
 
 from crouton.data import PreferenceDataset, format_chatml_sft_with_mask
@@ -65,3 +66,23 @@ def test_train_wp_bpe_ppig_json_and_dir_and_sft_masking(tmp_path):
     item = pref_ds[0]
     assert (item["chosen_labels"] != -100).any()
     assert (item["rejected_labels"] != -100).any()
+
+    # Synchronized prompt truncation & None content safety
+    sync_ds = PreferenceDataset(
+        pairs=[
+            {
+                "prompt": "Context token " * 40,
+                "chosen": "ok",
+                "rejected": "very long rejected continuation " * 15,
+            },
+            {"prompt": None, "chosen": "ok", "rejected": None},
+        ],
+        tokenizer=tok,
+        seq_len=24,
+    )
+    sync_item = sync_ds[0]
+    c_sup = (sync_item["chosen_labels"] != -100).nonzero(as_tuple=True)[0][0].item()
+    r_sup = (sync_item["rejected_labels"] != -100).nonzero(as_tuple=True)[0][0].item()
+    assert c_sup == r_sup and c_sup > 0
+    assert torch.equal(sync_item["chosen_ids"][: c_sup + 1], sync_item["rejected_ids"][: r_sup + 1])
+    assert (sync_ds[1]["chosen_labels"] != -100).any()

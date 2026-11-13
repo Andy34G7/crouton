@@ -30,6 +30,8 @@ class StreamingPackedDataset(IterableDataset):
         sources: list[tuple[str, str | None, str, str]] | None = None,
         eos_token: str = "<|endoftext|>",
         local_texts: list[str] | None = None,
+        shuffle_seed: int | None = None,
+        shuffle_buffer: int = 1000,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -44,6 +46,8 @@ class StreamingPackedDataset(IterableDataset):
             else None
         )
         self.eos_id = resolve_token_id(tokenizer, eos_token, fallback=0)
+        self.shuffle_seed = shuffle_seed
+        self.shuffle_buffer = shuffle_buffer
 
     def _iter_texts(self) -> Iterator[str]:
         worker = get_worker_info()
@@ -62,7 +66,12 @@ class StreamingPackedDataset(IterableDataset):
 
         from datasets import load_dataset
 
-        iters = [iter(load_dataset(name, subset, split=split, streaming=True)) for name, subset, split, _ in self.sources]
+        iters = []
+        for idx, (name, subset, split, _) in enumerate(self.sources):
+            ds = load_dataset(name, subset, split=split, streaming=True)
+            if self.shuffle_seed is not None:
+                ds = ds.shuffle(seed=self.shuffle_seed + idx, buffer_size=self.shuffle_buffer)
+            iters.append(iter(ds))
         fields = [field for _, _, _, field in self.sources]
         exhausted: set[int] = set()
         step = 0

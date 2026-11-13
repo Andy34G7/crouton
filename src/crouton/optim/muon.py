@@ -88,6 +88,34 @@ class Muon(Optimizer):
         return loss
 
 
+def _strip_wrapper_prefixes(name: str) -> str:
+    while name.startswith("_orig_mod.") or name.startswith("module."):
+        name = name.removeprefix("_orig_mod.").removeprefix("module.")
+    return name
+
+
+def build_adamw_param_groups(
+    model: nn.Module,
+    weight_decay: float = 0.01,
+) -> list[dict[str, object]]:
+    """Split trainable parameters into weight-decayed matrices and non-decayed 1D/embedding params."""
+    decay: list[torch.nn.Parameter] = []
+    nodecay: list[torch.nn.Parameter] = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        clean_name = _strip_wrapper_prefixes(name)
+        is_emb_or_head = "tok_emb" in clean_name or "lm_head" in clean_name
+        if p.ndim >= 2 and not is_emb_or_head:
+            decay.append(p)
+        else:
+            nodecay.append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": nodecay, "weight_decay": 0.0},
+    ]
+
+
 def build_optimizers(
     model: nn.Module,
     muon_lr: float = 2e-2,
@@ -97,7 +125,7 @@ def build_optimizers(
     """
     Partition parameters into Muon (2D block linear weights, excluding router/head/emb)
     and AdamW (embeddings, norms, router, 3D LoRA expert tensors).
-    Handles torch.compile OptimizedModule `_orig_mod.` prefixes transparently.
+    Handles torch.compile `_orig_mod.` and DDP `module.` prefixes transparently.
     """
     muon_params: list[torch.nn.Parameter] = []
     adamw_decay: list[torch.nn.Parameter] = []
@@ -107,7 +135,7 @@ def build_optimizers(
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        clean_name = name.removeprefix("_orig_mod.").removeprefix("module.")
+        clean_name = _strip_wrapper_prefixes(name)
         if clean_name.startswith("blocks."):
             has_blocks = True
         is_emb_or_head = "tok_emb" in clean_name or "lm_head" in clean_name

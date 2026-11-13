@@ -13,8 +13,14 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from crouton.data import SFTDataset
-from crouton.optim import set_optimizer_lr, wsd_lr_multiplier
-from crouton.train.common import get_device, load_checkpoint, save_checkpoint
+from crouton.optim import build_adamw_param_groups, set_optimizer_lr, wsd_lr_multiplier
+from crouton.train.common import (
+    get_device,
+    load_checkpoint,
+    next_or_restart,
+    save_checkpoint,
+    validate_tokenizer_vocab,
+)
 
 SFT_PRESETS: dict[str, tuple[str, str | None]] = {
     "smoltalk": ("HuggingFaceTB/smoltalk", "all"),
@@ -46,6 +52,7 @@ def run_sft(
         override_seq_len=seq_len,
     )
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+    validate_tokenizer_vocab(tokenizer, model_cfg)
 
     if examples_override is not None:
         examples = examples_override
@@ -59,11 +66,14 @@ def run_sft(
             if isinstance(msgs, list) and msgs:
                 examples.append(msgs)
 
+    if not examples:
+        raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
+
     ds = SFTDataset(examples, tokenizer=tokenizer, seq_len=seq_len)
     loader = DataLoader(ds, batch_size=micro_batch_size, shuffle=True)
     it = iter(loader)
 
-    opt = AdamW(model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.95))
+    opt = AdamW(build_adamw_param_groups(model, weight_decay=0.01), lr=lr, betas=(0.9, 0.95))
     model.train()
 
     for step in range(total_steps):
@@ -80,11 +90,7 @@ def run_sft(
         total_valid_tokens = 0
 
         for _ in range(grad_accum_steps):
-            try:
-                x, y, attn_mask = next(it)
-            except StopIteration:
-                it = iter(loader)
-                x, y, attn_mask = next(it)
+            (x, y, attn_mask), it = next_or_restart(it, loader)
             x, y, attn_mask = x.to(device), y.to(device), attn_mask.to(device)
             n_valid = int((y != -100).sum().item())
             with amp_ctx:

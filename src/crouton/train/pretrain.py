@@ -15,7 +15,7 @@ from crouton.config import CroutonConfig, TrainConfig
 from crouton.data import StreamingPackedDataset, resolve_token_id
 from crouton.model import CroutonForCausalLM
 from crouton.optim import build_optimizers, set_optimizer_lr, wsd_lr_multiplier
-from crouton.train.common import get_device, save_checkpoint, unwrap_model
+from crouton.train.common import get_device, next_or_restart, save_checkpoint, unwrap_model, validate_tokenizer_vocab
 
 
 @torch.no_grad()
@@ -72,12 +72,13 @@ def run_pretrain(
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
     tokenizer = WpBpePpigTokenizer.from_pretrained(train_cfg.tokenizer_path)
+    validate_tokenizer_vocab(tokenizer, model_cfg)
     local_texts = None
     if local_file is not None:
-        local_texts = [line for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+        local_texts = [line.strip() for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
     val_texts = None
     if val_file is not None:
-        val_texts = [line for line in Path(val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+        val_texts = [line.strip() for line in Path(val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
 
     dataset = StreamingPackedDataset(
         tokenizer=tokenizer,
@@ -87,8 +88,10 @@ def run_pretrain(
             ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
         ],
         local_texts=local_texts,
+        shuffle_seed=train_cfg.seed,
     )
-    loader = iter(DataLoader(dataset, batch_size=train_cfg.micro_batch_size))
+    dataloader = DataLoader(dataset, batch_size=train_cfg.micro_batch_size)
+    loader = iter(dataloader)
 
     raw_model = CroutonForCausalLM(model_cfg).to(device)
     muon_opt, adamw_opt = build_optimizers(
@@ -119,7 +122,7 @@ def run_pretrain(
         total_entropy = 0.0
 
         for _ in range(train_cfg.grad_accum_steps):
-            x, y = next(loader)
+            (x, y), loader = next_or_restart(loader, dataloader)
             x, y = x.to(device), y.to(device)
             with amp_ctx:
                 out = model(x, targets=y)
@@ -157,12 +160,15 @@ def main() -> None:
     parser.add_argument("--tokenizer", type=str, default="artifacts/tokenizer/wp_bpe_ppig_32k.json")
     parser.add_argument("--output-dir", type=str, default="checkpoints/pretrain")
     parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument("--vocab-size", type=int, default=None)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--decay-steps", type=int, default=2000)
     parser.add_argument("--micro-batch", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--muon-lr", type=float, default=2e-2)
     parser.add_argument("--adamw-lr", type=float, default=3e-4)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--save-interval", type=int, default=1000)
     parser.add_argument("--local-file", type=str, default=None)
@@ -171,10 +177,15 @@ def main() -> None:
     args = parser.parse_args()
 
     model_cfg = CroutonConfig.from_yaml(args.model_config)
+    if args.vocab_size is not None:
+        model_cfg.vocab_size = args.vocab_size
+    if args.seq_len is not None:
+        model_cfg.max_seq_len = args.seq_len
+        model_cfg.rope_original_max_seq_len = args.seq_len
     train_cfg = TrainConfig(
         output_dir=args.output_dir,
         tokenizer_path=args.tokenizer,
-        seq_len=model_cfg.max_seq_len,
+        seq_len=args.seq_len or model_cfg.max_seq_len,
         micro_batch_size=args.micro_batch,
         grad_accum_steps=args.grad_accum,
         total_steps=args.steps,
@@ -185,6 +196,7 @@ def main() -> None:
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         compile_model=not args.no_compile,
+        seed=args.seed,
     )
     run_pretrain(model_cfg, train_cfg, local_file=args.local_file, val_file=args.val_file)
 

@@ -52,23 +52,23 @@ class MergedLoRADenseMoE(nn.Module):
         nn.init.zeros_(self.down_B)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        router_logits = self.router(x)
+        router_logits = self.router(x).float()
         if self.training and self.router_jitter > 0.0:
             noise = torch.empty_like(router_logits).uniform_(1.0 - self.router_jitter, 1.0 + self.router_jitter)
             router_logits = router_logits * noise
-        weights = F.softmax(router_logits.float(), dim=-1).to(x.dtype)  # [B, T, E]
+        weights = F.softmax(router_logits, dim=-1)  # [B, T, E] fp32
 
         # Up projection: shared base + weighted low-rank expert deltas
         up_hidden = self.w_up(x)
         up_a = torch.einsum("btd,edr->bter", x, self.up_A)
-        up_a_weighted = up_a * weights.unsqueeze(-1)
+        up_a_weighted = up_a * weights.to(up_a.dtype).unsqueeze(-1)
         up_delta = torch.einsum("bter,erf->btf", up_a_weighted, self.up_B)
         act = F.relu(up_hidden + self.scale * up_delta).square()
 
         # Down projection: shared base + weighted low-rank expert deltas
         down_out = self.w_down(act)
         down_a = torch.einsum("btf,efr->bter", act, self.down_A)
-        down_a_weighted = down_a * weights.unsqueeze(-1)
+        down_a_weighted = down_a * weights.to(down_a.dtype).unsqueeze(-1)
         down_delta = torch.einsum("bter,erd->btd", down_a_weighted, self.down_B)
         out = down_out + self.scale * down_delta
 

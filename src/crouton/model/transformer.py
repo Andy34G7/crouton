@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from crouton.config import CroutonConfig
-from crouton.model.attention import HybridSparseAttention, _get_cached_swa_block_mask
+from crouton.model.attention import HybridSparseAttention, _get_cached_swa_block_mask, build_padded_attn_mask
 from crouton.model.moe import MergedLoRADenseMoE
 from crouton.model.norm import RMSNorm
 from crouton.model.rope import RotaryEmbedding
@@ -39,6 +39,7 @@ class CroutonBlock(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         swa_block_mask: object | None = None,
+        precomputed_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = x + self.attn(
             self.attn_norm(x),
@@ -46,6 +47,7 @@ class CroutonBlock(nn.Module):
             sin,
             attention_mask=attention_mask,
             swa_block_mask=swa_block_mask,
+            precomputed_mask=precomputed_mask,
         )
         moe_out, router_weights = self.moe(self.moe_norm(x))
         x = x + moe_out
@@ -71,6 +73,8 @@ class CroutonForCausalLM(nn.Module):
         self._needs_flex_swa_mask = any(
             not block.attn.is_global and block.attn.use_flex for block in self.blocks
         )
+        self._has_global_layers = any(block.attn.is_global for block in self.blocks)
+        self._has_swa_layers = any(not block.attn.is_global for block in self.blocks)
         self.final_norm = RMSNorm(config.d_model, eps=config.norm_eps)
 
         if config.tie_embeddings:
@@ -110,6 +114,8 @@ class CroutonForCausalLM(nn.Module):
             attention_mask = None
 
         swa_block_mask = None
+        global_padded_mask = None
+        swa_padded_mask = None
         if attention_mask is None and x.is_cuda and self._needs_flex_swa_mask:
             swa_block_mask = _get_cached_swa_block_mask(
                 seq_len=seq_len,
@@ -117,10 +123,27 @@ class CroutonForCausalLM(nn.Module):
                 sink_tokens=self.config.sink_tokens,
                 device=x.device,
             )
+        elif attention_mask is not None:
+            if self._has_global_layers:
+                global_padded_mask = build_padded_attn_mask(
+                    attention_mask, seq_len, is_global=True, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
+                )
+            if self._has_swa_layers:
+                swa_padded_mask = build_padded_attn_mask(
+                    attention_mask, seq_len, is_global=False, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
+                )
 
         entropies = []
         for block in self.blocks:
-            x, rw = block(x, cos, sin, attention_mask=attention_mask, swa_block_mask=swa_block_mask)
+            layer_mask = global_padded_mask if block.attn.is_global else swa_padded_mask
+            x, rw = block(
+                x,
+                cos,
+                sin,
+                attention_mask=attention_mask,
+                swa_block_mask=swa_block_mask,
+                precomputed_mask=layer_mask,
+            )
             rw_f = rw.float().clamp(min=1e-8)
             entropies.append(-(rw_f * rw_f.log()).sum(dim=-1).mean())
 
@@ -132,17 +155,17 @@ class CroutonForCausalLM(nn.Module):
 
         if self.config.logit_softcap > 0.0:
             cap = self.config.logit_softcap
-            logits = cap * torch.tanh(logits / cap)
+            logits = (cap * torch.tanh(logits.float() / cap)).to(logits.dtype)
 
         loss = None
         if targets is not None:
-            flat_logits = logits.view(-1, logits.size(-1))
+            flat_logits = logits.float().view(-1, logits.size(-1))
             flat_targets = targets.view(-1)
             valid_mask = flat_targets != -100
             safe_targets = torch.where(valid_mask, flat_targets, 0)
             tok_loss = F.cross_entropy(flat_logits, safe_targets, reduction="none")
             valid_f = valid_mask.float()
-            loss = (tok_loss.float() * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+            loss = (tok_loss * valid_f).sum() / valid_f.sum().clamp(min=1.0)
 
         router_entropy = torch.stack(entropies).mean() if entropies else None
         return CroutonOutput(logits=logits, loss=loss, router_entropy=router_entropy)
@@ -159,7 +182,11 @@ class CroutonForCausalLM(nn.Module):
         """Autoregressive generation with fp32 sampling, top-k filtering, and EOS stopping."""
         was_training = self.training
         self.eval()
-        eos_set = set(eos_token_ids) if eos_token_ids is not None else set()
+        eos_tensor = (
+            torch.tensor(sorted(set(eos_token_ids)), dtype=torch.long, device=input_ids.device)
+            if eos_token_ids
+            else None
+        )
         ids = input_ids
         finished = torch.zeros(ids.size(0), dtype=torch.bool, device=ids.device)
 
@@ -176,11 +203,9 @@ class CroutonForCausalLM(nn.Module):
                 probs = F.softmax(scaled, dim=-1)
                 next_tok = torch.multinomial(probs, num_samples=1)
             ids = torch.cat([ids, next_tok], dim=-1)
-            if eos_set:
-                for idx in range(ids.size(0)):
-                    if int(next_tok[idx, 0].item()) in eos_set:
-                        finished[idx] = True
-                if finished.all():
+            if eos_tensor is not None:
+                finished = finished | torch.isin(next_tok.squeeze(-1), eos_tensor)
+                if bool(finished.all().item()):
                     break
 
         if was_training:

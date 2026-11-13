@@ -15,8 +15,14 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from crouton.data import PreferenceDataset
-from crouton.optim import set_optimizer_lr, wsd_lr_multiplier
-from crouton.train.common import get_device, load_checkpoint, save_checkpoint
+from crouton.optim import build_adamw_param_groups, set_optimizer_lr, wsd_lr_multiplier
+from crouton.train.common import (
+    get_device,
+    load_checkpoint,
+    next_or_restart,
+    save_checkpoint,
+    validate_tokenizer_vocab,
+)
 
 
 def sequence_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -93,6 +99,7 @@ def run_preference_tuning(
             p.requires_grad = False
 
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+    validate_tokenizer_vocab(tokenizer, model_cfg)
 
     if pairs_override is not None:
         pairs = pairs_override
@@ -111,11 +118,14 @@ def run_preference_tuning(
                     }
                 )
 
+    if not pairs:
+        raise ValueError(f"Preference dataset '{dataset_name}' yielded zero valid (prompt, chosen, rejected) pairs.")
+
     ds = PreferenceDataset(pairs, tokenizer=tokenizer, seq_len=seq_len)
     loader = DataLoader(ds, batch_size=micro_batch_size, shuffle=True)
     it = iter(loader)
 
-    opt = AdamW(policy.parameters(), lr=lr, weight_decay=0.01)
+    opt = AdamW(build_adamw_param_groups(policy, weight_decay=0.01), lr=lr, betas=(0.9, 0.95))
     policy.train()
 
     for step in range(total_steps):
@@ -128,19 +138,17 @@ def run_preference_tuning(
         )
         set_optimizer_lr(opt, lr, mult)
         opt.zero_grad(set_to_none=True)
-        total_loss = 0.0
+        total_weighted_loss = 0.0
+        total_pairs = 0
         for _ in range(grad_accum_steps):
-            try:
-                batch = next(it)
-            except StopIteration:
-                it = iter(loader)
-                batch = next(it)
+            batch, it = next_or_restart(it, loader)
             c_ids = batch["chosen_ids"].to(device)
             c_lbl = batch["chosen_labels"].to(device)
             c_mask = batch["chosen_mask"].to(device)
             r_ids = batch["rejected_ids"].to(device)
             r_lbl = batch["rejected_labels"].to(device)
             r_mask = batch["rejected_mask"].to(device)
+            n_pairs = int(c_ids.size(0))
 
             with amp_ctx:
                 c_out = policy(c_ids, targets=c_lbl if use_orpo else None, attention_mask=c_mask)
@@ -163,13 +171,20 @@ def run_preference_tuning(
                         ref_r = sequence_logps(ref_model(r_ids, attention_mask=r_mask).logits, r_lbl)
                     loss = dpo_loss(p_c, p_r, ref_c, ref_r, beta=beta)
 
-                loss = loss / grad_accum_steps
+                weighted_loss = loss * float(n_pairs)
 
-            loss.backward()
-            total_loss += float(loss.item())
+            weighted_loss.backward()
+            total_weighted_loss += float(weighted_loss.item())
+            total_pairs += n_pairs
 
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-        opt.step()
+        if total_pairs > 0:
+            for p in policy.parameters():
+                if p.grad is not None:
+                    p.grad.div_(float(total_pairs))
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            opt.step()
+
+        total_loss = total_weighted_loss / max(1, total_pairs)
 
         if step % 10 == 0:
             mode = "orpo" if use_orpo else "dpo"

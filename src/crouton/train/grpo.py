@@ -15,7 +15,7 @@ from tokenisers import WpBpePpigTokenizer
 from torch.optim import AdamW
 
 from crouton.data.pretrain_data import resolve_token_id
-from crouton.train.common import get_device, load_checkpoint, save_checkpoint
+from crouton.train.common import get_device, load_checkpoint, save_checkpoint, validate_tokenizer_vocab
 
 _HASHED_NUM_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
 _BARE_NUM_RE = re.compile(r"-?[\d,]+(?:\.\d+)?")
@@ -165,6 +165,8 @@ def run_grpo(
 ) -> None:
     if not prompts_with_verifiers:
         raise ValueError("prompts_with_verifiers must be non-empty")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
 
     device = get_device()
     use_bf16 = device.type == "cuda"
@@ -177,6 +179,7 @@ def run_grpo(
         p.requires_grad = False
 
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+    validate_tokenizer_vocab(tokenizer, model_cfg)
     eos_ids = [
         resolve_token_id(tokenizer, "<|im_end|>", fallback=0),
         resolve_token_id(tokenizer, "<|endoftext|>", fallback=0),
@@ -193,7 +196,6 @@ def run_grpo(
 
         completions: list[torch.Tensor] = []
         rewards: list[float] = []
-        old_tok_logps: list[torch.Tensor] = []
         ref_tok_logps: list[torch.Tensor] = []
 
         policy.eval()
@@ -210,7 +212,6 @@ def run_grpo(
             rewards.append(verifier(text))
 
             with torch.no_grad(), amp_ctx:
-                old_tok_logps.append(_gather_completion_logps(policy, seq, p_len, model_cfg.max_seq_len))
                 ref_tok_logps.append(_gather_completion_logps(ref_model, seq, p_len, model_cfg.max_seq_len))
 
         policy.train()
@@ -219,6 +220,8 @@ def run_grpo(
         for seq in completions:
             with amp_ctx:
                 cur_tok_logps.append(_gather_completion_logps(policy, seq, p_len, model_cfg.max_seq_len))
+        # Single-step on-policy update per rollout: detach cur_tok_logps as old_logps cleanly.
+        old_tok_logps = [t.detach() for t in cur_tok_logps]
 
         max_gen = max(t.numel() for t in cur_tok_logps)
         padded_cur = torch.zeros((group_size, max_gen), dtype=torch.float32, device=device)

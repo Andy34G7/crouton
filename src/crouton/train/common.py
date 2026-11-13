@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
+from torch.utils.data import DataLoader
 
 from crouton.config import CroutonConfig
 from crouton.model import CroutonForCausalLM
+
+_T = TypeVar("_T")
+
+
+def validate_tokenizer_vocab(tokenizer, model_cfg: CroutonConfig) -> None:
+    """Fail fast if the tokenizer produces IDs beyond the model embedding table."""
+    if tokenizer.vocab_size > model_cfg.vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab_size ({tokenizer.vocab_size}) exceeds model vocab_size ({model_cfg.vocab_size})."
+        )
+
+
+def next_or_restart(it: Iterator[_T], dataloader: DataLoader[_T]) -> tuple[_T, Iterator[_T]]:
+    """Fetch next batch from an iterator, restarting cleanly on exhaustion or failing on empty loaders."""
+    try:
+        return next(it), it
+    except StopIteration:
+        fresh = iter(dataloader)
+        try:
+            return next(fresh), fresh
+        except StopIteration as exc:
+            raise RuntimeError("DataLoader yielded zero batches; verify dataset content and batch size.") from exc
 
 
 def get_device() -> torch.device:

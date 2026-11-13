@@ -12,7 +12,13 @@ from torch.utils.data import DataLoader
 
 from crouton.data import StreamingPackedDataset
 from crouton.optim import build_optimizers, set_optimizer_lr, wsd_lr_multiplier
-from crouton.train.common import get_device, load_checkpoint, save_checkpoint
+from crouton.train.common import (
+    get_device,
+    load_checkpoint,
+    next_or_restart,
+    save_checkpoint,
+    validate_tokenizer_vocab,
+)
 
 
 def run_midtrain(
@@ -30,6 +36,8 @@ def run_midtrain(
     adamw_lr: float = 1.5e-4,
     dataset_name: str | None = None,
     subset: str | None = None,
+    split: str = "train",
+    text_field: str = "text",
     local_file: str | None = None,
 ) -> None:
     device = get_device()
@@ -44,13 +52,14 @@ def run_midtrain(
         override_rope_scaling_type=rope_scaling_type,
     )
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+    validate_tokenizer_vocab(tokenizer, model_cfg)
 
     local_texts = None
     if local_file is not None:
-        local_texts = [line for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+        local_texts = [line.strip() for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
 
     sources = (
-        [(dataset_name, subset, "train", "text")]
+        [(dataset_name, subset, split, text_field)]
         if dataset_name
         else [
             ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
@@ -62,8 +71,10 @@ def run_midtrain(
         seq_len=seq_len,
         sources=sources,
         local_texts=local_texts,
+        shuffle_seed=1337,
     )
-    loader = iter(DataLoader(dataset, batch_size=micro_batch_size))
+    dataloader = DataLoader(dataset, batch_size=micro_batch_size)
+    loader = iter(dataloader)
 
     muon_opt, adamw_opt = build_optimizers(model, muon_lr=muon_lr, adamw_lr=adamw_lr)
     model.train()
@@ -83,7 +94,7 @@ def run_midtrain(
         adamw_opt.zero_grad(set_to_none=True)
         total_loss = 0.0
         for _ in range(grad_accum_steps):
-            x, y = next(loader)
+            (x, y), loader = next_or_restart(loader, dataloader)
             x, y = x.to(device), y.to(device)
             with amp_ctx:
                 out = model(x, targets=y)
@@ -117,6 +128,8 @@ def main() -> None:
     parser.add_argument("--adamw-lr", type=float, default=1.5e-4)
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--subset", type=str, default=None)
+    parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--local-file", type=str, default=None)
     args = parser.parse_args()
 
@@ -136,6 +149,8 @@ def main() -> None:
         adamw_lr=args.adamw_lr,
         dataset_name=args.dataset,
         subset=subset,
+        split=args.split,
+        text_field=args.text_field,
         local_file=args.local_file,
     )
 

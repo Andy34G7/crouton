@@ -10,6 +10,61 @@ from torch.utils.data import Dataset
 from crouton.data.pretrain_data import resolve_token_id
 
 
+def _encode_chatml_messages(
+    messages: list[dict[str, str]],
+    tokenizer,
+    mask_earlier_assistant_turns: bool = False,
+) -> tuple[list[int], list[int]]:
+    input_ids: list[int] = []
+    targets: list[int] = []
+    last_assistant_idx = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+
+    for idx, msg in enumerate(messages):
+        role = str(msg.get("role", "user"))
+        raw_content = msg.get("content")
+        content = "" if raw_content is None else str(raw_content)
+        header_ids = tokenizer.encode(f"<|im_start|>{role}\n")
+        body_ids = tokenizer.encode(f"{content}<|im_end|>\n")
+
+        input_ids.extend(header_ids)
+        targets.extend([-100] * len(header_ids))
+
+        input_ids.extend(body_ids)
+        train_turn = role == "assistant" and (not mask_earlier_assistant_turns or idx == last_assistant_idx)
+        if train_turn:
+            targets.extend(body_ids)
+        else:
+            targets.extend([-100] * len(body_ids))
+
+    return input_ids, targets
+
+
+def _pad_and_shift(
+    input_ids: list[int],
+    targets: list[int],
+    seq_len: int,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_tokens = seq_len + 1
+    if len(input_ids) > max_tokens:
+        input_ids = input_ids[:max_tokens]
+        targets = targets[:max_tokens]
+    x = input_ids[:-1]
+    y = targets[1:]
+    valid_len = len(x)
+    attn_mask = [1] * valid_len
+    if valid_len < seq_len:
+        pad_len = seq_len - valid_len
+        x = x + [pad_id] * pad_len
+        y = y + [-100] * pad_len
+        attn_mask = attn_mask + [0] * pad_len
+    return (
+        torch.tensor(x, dtype=torch.long),
+        torch.tensor(y, dtype=torch.long),
+        torch.tensor(attn_mask, dtype=torch.bool),
+    )
+
+
 def format_chatml_sft_with_mask(
     messages: list[dict[str, str]],
     tokenizer,
@@ -23,26 +78,7 @@ def format_chatml_sft_with_mask(
     Returns (input_ids, targets, attention_mask) each of shape [seq_len].
     """
     pad_id = resolve_token_id(tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0))
-    input_ids: list[int] = []
-    targets: list[int] = []
-
-    last_assistant_idx = max((i for i, m in enumerate(messages) if m["role"] == "assistant"), default=-1)
-
-    for idx, msg in enumerate(messages):
-        role = msg["role"]
-        content = msg["content"]
-        header_ids = tokenizer.encode(f"<|im_start|>{role}\n")
-        body_ids = tokenizer.encode(f"{content}<|im_end|>\n")
-
-        input_ids.extend(header_ids)
-        targets.extend([-100] * len(header_ids))
-
-        input_ids.extend(body_ids)
-        train_turn = role == "assistant" and (not mask_earlier_assistant_turns or idx == last_assistant_idx)
-        if train_turn:
-            targets.extend(body_ids)
-        else:
-            targets.extend([-100] * len(body_ids))
+    input_ids, targets = _encode_chatml_messages(messages, tokenizer, mask_earlier_assistant_turns)
 
     max_tokens = seq_len + 1
     if len(input_ids) > max_tokens:
@@ -62,21 +98,7 @@ def format_chatml_sft_with_mask(
                 input_ids = input_ids[:max_tokens]
                 targets = targets[:max_tokens]
 
-    x = input_ids[:-1]
-    y = targets[1:]
-    valid_len = len(x)
-    attn_mask = [1] * valid_len
-    if valid_len < seq_len:
-        pad_len = seq_len - valid_len
-        x = x + [pad_id] * pad_len
-        y = y + [-100] * pad_len
-        attn_mask = attn_mask + [0] * pad_len
-
-    return (
-        torch.tensor(x, dtype=torch.long),
-        torch.tensor(y, dtype=torch.long),
-        torch.tensor(attn_mask, dtype=torch.bool),
-    )
+    return _pad_and_shift(input_ids, targets, seq_len, pad_id)
 
 
 def format_chatml_sft(
@@ -111,6 +133,9 @@ class PreferenceDataset(Dataset):
         self.pairs = pairs
         self.tokenizer = tokenizer
         self.seq_len = seq_len
+        self.pad_id = resolve_token_id(
+            tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0)
+        )
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -120,20 +145,60 @@ class PreferenceDataset(Dataset):
         if isinstance(response, list) and all(isinstance(m, dict) and "role" in m and "content" in m for m in response):
             return response
         if isinstance(prompt, list) and all(isinstance(m, dict) and "role" in m and "content" in m for m in prompt):
-            return [*prompt, {"role": "assistant", "content": str(response)}]
-        return [{"role": "user", "content": str(prompt)}, {"role": "assistant", "content": str(response)}]
+            return [*prompt, {"role": "assistant", "content": "" if response is None else str(response)}]
+        return [
+            {"role": "user", "content": "" if prompt is None else str(prompt)},
+            {"role": "assistant", "content": "" if response is None else str(response)},
+        ]
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         item = self.pairs[idx]
         c_msgs = self._to_messages(item["prompt"], item["chosen"])
         r_msgs = self._to_messages(item["prompt"], item["rejected"])
 
-        c_x, c_y, c_mask = format_chatml_sft_with_mask(
-            c_msgs, self.tokenizer, self.seq_len, mask_earlier_assistant_turns=True
-        )
-        r_x, r_y, r_mask = format_chatml_sft_with_mask(
-            r_msgs, self.tokenizer, self.seq_len, mask_earlier_assistant_turns=True
-        )
+        common_k = 0
+        while common_k < len(c_msgs) and common_k < len(r_msgs) and c_msgs[common_k] == r_msgs[common_k]:
+            common_k += 1
+
+        if common_k == len(c_msgs) == len(r_msgs):
+            c_x, c_y, c_mask = format_chatml_sft_with_mask(
+                c_msgs, self.tokenizer, self.seq_len, mask_earlier_assistant_turns=True
+            )
+            r_x, r_y, r_mask = c_x.clone(), c_y.clone(), c_mask.clone()
+        else:
+            shared_ids, _ = _encode_chatml_messages(c_msgs[:common_k], self.tokenizer, mask_earlier_assistant_turns=True)
+            c_tail = c_msgs[common_k:]
+            r_tail = r_msgs[common_k:]
+
+            if len(c_tail) == 1 and len(r_tail) == 1 and c_tail[0].get("role") == r_tail[0].get("role") == "assistant":
+                hdr = self.tokenizer.encode("<|im_start|>assistant\n")
+                shared_ids.extend(hdr)
+                c_raw = "" if c_tail[0].get("content") is None else str(c_tail[0].get("content"))
+                r_raw = "" if r_tail[0].get("content") is None else str(r_tail[0].get("content"))
+                c_comp_ids = self.tokenizer.encode(f"{c_raw}<|im_end|>\n")
+                r_comp_ids = self.tokenizer.encode(f"{r_raw}<|im_end|>\n")
+                c_comp_tgt = list(c_comp_ids)
+                r_comp_tgt = list(r_comp_ids)
+            else:
+                c_comp_ids, c_comp_tgt = _encode_chatml_messages(c_tail, self.tokenizer, mask_earlier_assistant_turns=True)
+                r_comp_ids, r_comp_tgt = _encode_chatml_messages(r_tail, self.tokenizer, mask_earlier_assistant_turns=True)
+
+            # Synchronize prompt truncation across chosen/rejected so both condition on identical prompt tokens.
+            max_tokens = self.seq_len + 1
+            max_comp = max(len(c_comp_ids), len(r_comp_ids))
+            if len(shared_ids) + max_comp > max_tokens:
+                keep_prompt = max(0, max_tokens - max_comp)
+                if keep_prompt == 0 and shared_ids and max_comp >= max_tokens:
+                    keep_prompt = min(len(shared_ids), max_tokens // 2)
+                    comp_budget = max_tokens - keep_prompt
+                    c_comp_ids, c_comp_tgt = c_comp_ids[:comp_budget], c_comp_tgt[:comp_budget]
+                    r_comp_ids, r_comp_tgt = r_comp_ids[:comp_budget], r_comp_tgt[:comp_budget]
+                shared_ids = shared_ids[-keep_prompt:] if keep_prompt > 0 else []
+
+            shared_tgt = [-100] * len(shared_ids)
+            c_x, c_y, c_mask = _pad_and_shift(shared_ids + c_comp_ids, shared_tgt + c_comp_tgt, self.seq_len, self.pad_id)
+            r_x, r_y, r_mask = _pad_and_shift(shared_ids + r_comp_ids, shared_tgt + r_comp_tgt, self.seq_len, self.pad_id)
+
         return {
             "chosen_ids": c_x,
             "chosen_labels": c_y,

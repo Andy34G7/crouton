@@ -16,7 +16,7 @@ try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
     HAS_FLEX_ATTENTION = True
-    _compiled_flex_attention = torch.compile(flex_attention)
+    _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
 except ImportError:
     HAS_FLEX_ATTENTION = False
     create_block_mask = None
@@ -43,6 +43,24 @@ def build_swa_sink_mask(
     return mask.unsqueeze(0).unsqueeze(0)
 
 
+def build_padded_attn_mask(
+    attention_mask: torch.Tensor,
+    seq_len: int,
+    is_global: bool,
+    sliding_window: int,
+    sink_tokens: int,
+) -> torch.Tensor:
+    """Build [B, 1, T, T] boolean causal/SWA mask honoring key padding without NaN rows."""
+    key_keep = attention_mask[:, None, None, :].bool()
+    if is_global:
+        base_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=attention_mask.device))
+        base_mask = base_mask.unsqueeze(0).unsqueeze(0)
+    else:
+        base_mask = build_swa_sink_mask(seq_len, sliding_window, sink_tokens, attention_mask.device)
+    eye = torch.eye(seq_len, dtype=torch.bool, device=attention_mask.device).unsqueeze(0).unsqueeze(0)
+    return (base_mask & key_keep) | eye
+
+
 @torch.compiler.disable
 def _get_cached_swa_block_mask(
     seq_len: int,
@@ -50,7 +68,8 @@ def _get_cached_swa_block_mask(
     sink_tokens: int,
     device: torch.device,
 ):
-    key = (seq_len, window_size, sink_tokens, device.type, device.index)
+    dev_idx = device.index if device.index is not None else (torch.cuda.current_device() if device.type == "cuda" else 0)
+    key = (seq_len, window_size, sink_tokens, device.type, dev_idx)
     cached = _BLOCK_MASK_CACHE.get(key)
     if cached is not None:
         _BLOCK_MASK_CACHE.move_to_end(key)
@@ -123,6 +142,7 @@ class HybridSparseAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         swa_block_mask: object | None = None,
+        precomputed_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
 
@@ -137,19 +157,21 @@ class HybridSparseAttention(nn.Module):
 
         q, k = apply_rope(q, k, cos, sin)
 
-        # Avoid O(T^2) dense mask overhead when batch has no padding tokens (outside torch.compile).
-        if attention_mask is not None and not torch.compiler.is_compiling() and bool(attention_mask.all().item()):
+        if precomputed_mask is not None:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=precomputed_mask, enable_gqa=self.n_rep > 1)
+        elif attention_mask is not None and not torch.compiler.is_compiling() and bool(attention_mask.all().item()):
             attention_mask = None
 
-        if attention_mask is not None:
-            key_keep = attention_mask[:, None, None, :].bool()  # [B, 1, 1, T]
-            if self.is_global:
-                base_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device))
-                base_mask = base_mask.unsqueeze(0).unsqueeze(0)
-            else:
-                base_mask = build_swa_sink_mask(seq_len, self.sliding_window, self.sink_tokens, q.device)
-            eye = torch.eye(seq_len, dtype=torch.bool, device=q.device).unsqueeze(0).unsqueeze(0)
-            full_mask = (base_mask & key_keep) | eye
+        if precomputed_mask is not None:
+            pass
+        elif attention_mask is not None:
+            full_mask = build_padded_attn_mask(
+                attention_mask=attention_mask,
+                seq_len=seq_len,
+                is_global=self.is_global,
+                sliding_window=self.sliding_window,
+                sink_tokens=self.sink_tokens,
+            )
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=full_mask, enable_gqa=self.n_rep > 1)
         elif self.is_global:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.n_rep > 1)

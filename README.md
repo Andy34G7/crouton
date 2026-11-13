@@ -5,15 +5,16 @@ A scalable PyTorch language model family (from ~14M prototypes up to ~300M param
 ## Setup & Installation
 
 - **Python**: `>=3.11`
+- **Rust toolchain**: `rustc` and `cargo` are required on `PATH` when building the editable PyO3 extension in `../tokenisers`.
 - **Sibling dependency**: Requires [`../tokenisers`](../tokenisers) checked out alongside this repository (`pyproject.toml` links `../tokenisers` via `[tool.uv.sources]`).
 
 ```bash
 # Recommended (using uv)
-uv sync --extra dev          # includes pytest
-uv sync --extra dev --extra eval   # adds lm-eval>=0.4.0 for benchmark tasks
+uv sync --extra dev --extra eval   # includes pytest and lm-eval>=0.4.0
+source .venv/bin/activate          # or prefix commands below with `uv run`
 
 # Alternative (pip)
-pip install -e ../tokenisers -e ".[dev]"
+pip install -e ../tokenisers -e ".[dev,eval]"
 ```
 
 ## Model Configurations
@@ -29,12 +30,12 @@ pip install -e ../tokenisers -e ".[dev]"
 ## Architecture
 
 - **Tied Embeddings**: Input and output token embeddings are tied by default (`tie_embeddings=True` in `CroutonConfig`).
-- **Merged-LoRA Dense MoE (ReLU^2)** ([`src/crouton/model/moe.py`](src/crouton/model/moe.py)): End-to-end differentiable 2-layer MLP with no token dropping, injecting router-weighted low-rank (LoRA) expert deltas scaled by `scale = expert_alpha / expert_rank` into both `w_up` (pre-nonlinearity) and `w_down`:
-  - `act = ReLU(w_up(x) + scale * sum_e w_e * (x @ A_up[e] @ B_up[e]))^2`
-  - `y = w_down(act) + scale * sum_e w_e * (act @ A_down[e] @ B_down[e])`
-  - Router entropy (`router_entropy`) is computed and logged during training with no auxiliary load-balancing loss.
+- **Merged-LoRA Dense MoE (ReLU^2)** ([`src/crouton/model/moe.py`](src/crouton/model/moe.py)): End-to-end differentiable 2-layer MLP with no token dropping, injecting router-weighted low-rank (LoRA) expert deltas (`up_A`, `up_B`, `down_A`, `down_B`) scaled by `scale = expert_alpha / expert_rank` into both `w_up` (pre-nonlinearity) and `w_down`:
+  - `act = ReLU(w_up(x) + scale * sum_e w_e * (x @ up_A[e] @ up_B[e]))^2`
+  - `y = w_down(act) + scale * sum_e w_e * (act @ down_A[e] @ down_B[e])`
+  - Router entropy (`router_entropy`) is computed per forward pass and logged during pretraining, with no auxiliary load-balancing loss.
 - **Hybrid Sparse Attention** ([`src/crouton/model/attention.py`](src/crouton/model/attention.py)): Grouped-Query Attention (GQA) with RMSNorm QK-Norm (`qk_norm=True`), alternating Sliding Window Attention (SWA; `sliding_window=512`, `sink_tokens=4`) and Global Full Attention every `global_layer_interval=4` layers (3:1 ratio; final layer `n_layers - 1` is always Global via `is_global_layer`).
-  - **Dispatch**: Global layers always use causal Scaled Dot-Product Attention (SDPA). SWA layers use cached `FlexAttention` block masks on CUDA when `use_flex_attention=True` and masked SDPA on non-CUDA devices or when `use_flex_attention=False`.
+  - **Dispatch**: When no padding `attention_mask` is active, Global layers use causal Scaled Dot-Product Attention (SDPA) and SWA layers use cached `FlexAttention` block masks on CUDA (`use_flex_attention=True`, falling back to masked SDPA otherwise). Padded SFT/DPO batches use model-level precomputed key-padding masks with SDPA.
 - **Context Length & RoPE Scaling** ([`src/crouton/model/rope.py`](src/crouton/model/rope.py)): Pretrained at `2048` tokens and extendable to `4096` in mid-training via YaRN (`rope_scaling_type="yarn"`, wavelength-band ramp + `mscale`) or NTK-aware base scaling (`"ntk"`).
 
 ## Tokenizer
@@ -82,7 +83,7 @@ python -m crouton.train.sft \
   --preset smoltalk --seq-len 4096
 ```
 
-5. **Stage 3a — Preference Tuning (DPO / ORPO)** (`AdamW`, `seq_len=4096`, multi-turn history preserved on `argilla/ultrafeedback-binarized-preferences-cleaned`; add `--orpo` for reference-free Odds Ratio Preference Optimization):
+5. **Stage 3a — Preference Tuning (DPO / ORPO)** (`AdamW`, `seq_len=4096`, synchronized prompt truncation & multi-turn history on `argilla/ultrafeedback-binarized-preferences-cleaned`; add `--orpo --output-dir checkpoints/orpo` for reference-free Odds Ratio Preference Optimization):
 
 ```bash
 python -m crouton.train.dpo \
@@ -92,7 +93,7 @@ python -m crouton.train.dpo \
   --seq-len 4096
 ```
 
-6. **Stage 3b — Reasoning RL via GRPO (Group Relative Policy Optimization, Optional)** (per-token clipped policy ratios and Schulman k3 KL estimator on `openai/gsm8k` with exact numeric `#### <answer>` reward verification, or `--builtin-math` for offline arithmetic tasks):
+6. **Stage 3b — Reasoning RL via GRPO (Group Relative Policy Optimization, Optional)** (per-token clipped policy ratios and Schulman k3 KL estimator on `openai/gsm8k` with numeric answer verification preferring `#### <answer>`, or `--builtin-math` for offline arithmetic tasks):
 
 ```bash
 python -m crouton.train.grpo \
@@ -101,14 +102,16 @@ python -m crouton.train.grpo \
   --output-dir checkpoints/grpo
 ```
 
-7. **Evaluation** (validation loss, Perplexity (PPL), and Bits-Per-Byte (BPB) via `--val-file`, and/or `lm-eval-harness` benchmarks via `--tasks`; pass `--compare-checkpoint` for side-by-side comparison against another `crouton` checkpoint):
+7. **Evaluation** (run `lm-eval-harness` benchmarks via `--tasks`, and/or compute validation loss, Perplexity (PPL), and Bits-Per-Byte (BPB) via `--val-file` using one UTF-8 document per non-empty line; defaults to checkpoint `max_seq_len`; pass `checkpoints/grpo/final.pt` if Stage 3b was run, and `--compare-checkpoint` for side-by-side comparison):
 
 ```bash
 python -m crouton.eval.eval_runner \
   --checkpoint checkpoints/dpo/final.pt \
   --tokenizer artifacts/tokenizer/wp_bpe_ppig_32k.json \
-  --val-file path/to/val.txt \
   --tasks hellaswag,arc_easy,piqa
+
+# Optional BPB / PPL evaluation on a UTF-8 validation file (one document per line):
+# python -m crouton.eval.eval_runner --checkpoint checkpoints/dpo/final.pt --val-file val.txt
 ```
 
 ## Verification & Testing
@@ -116,5 +119,5 @@ python -m crouton.eval.eval_runner \
 Run the unit and end-to-end smoke test suite (covering SWA+sink masks, YaRN/NTK RoPE, `attention_mask`, `generate()`, `Muon`+`AdamW`+`WSD`, `_orig_mod.` checkpoint loading, `wp-bpe-ppig` pretokenization, and all training/eval stages):
 
 ```bash
-PYTHONPATH=src pytest -v
+pytest -v
 ```
