@@ -27,6 +27,7 @@ from crouton.train.common import (
     normalize_optional_subset,
     save_checkpoint,
     strip_required_paths,
+    validate_output_dir,
     validate_tokenizer_vocab,
 )
 
@@ -131,6 +132,7 @@ def run_preference_tuning(
         tokenizer_path=tokenizer_path,
         output_dir=output_dir,
     )
+    validate_output_dir(output_dir)
     subset = normalize_optional_subset(subset)
     _validate_dpo_args(
         seq_len=seq_len,
@@ -144,6 +146,12 @@ def run_preference_tuning(
         dataset_name=dataset_name,
         require_dataset=pairs_override is None,
     )
+    if pairs_override is not None:
+        if not pairs_override:
+            raise ValueError(f"Preference dataset '{dataset_name}' yielded zero valid (prompt, chosen, rejected) pairs.")
+        if not all(is_valid_preference_pair(p) for p in pairs_override):
+            raise ValueError("Invalid preference pair in pairs_override: expected prompt, chosen, and rejected fields")
+        pairs = pairs_override
     torch.manual_seed(seed)
     device = get_device()
     use_bf16 = bf16 and bf16_supported(device)
@@ -153,11 +161,7 @@ def run_preference_tuning(
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
 
-    if pairs_override is not None:
-        if not all(is_valid_preference_pair(p) for p in pairs_override):
-            raise ValueError("Invalid preference pair in pairs_override: expected prompt, chosen, and rejected fields")
-        pairs = pairs_override
-    else:
+    if pairs_override is None:
         raw = load_dataset(dataset_name.strip(), subset, split="train", streaming=True)
         pairs = []
         for row in raw:
@@ -171,9 +175,8 @@ def run_preference_tuning(
                 )
                 if len(pairs) >= max_examples:
                     break
-
-    if not pairs:
-        raise ValueError(f"Preference dataset '{dataset_name}' yielded zero valid (prompt, chosen, rejected) pairs.")
+        if not pairs:
+            raise ValueError(f"Preference dataset '{dataset_name}' yielded zero valid (prompt, chosen, rejected) pairs.")
 
     ds = PreferenceDataset(pairs, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
     if not any(
@@ -305,6 +308,7 @@ def main() -> None:
                 "--output-dir": args.output_dir,
             }
         )
+        validate_output_dir(output_dir)
         _validate_dpo_args(
             seq_len=args.seq_len,
             total_steps=args.steps,

@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from functools import partial
 import math
 from pathlib import Path
+from typing import Any
 
 import torch
 from datasets import load_dataset
@@ -25,6 +26,7 @@ from crouton.train.common import (
     normalize_optional_subset,
     save_checkpoint,
     strip_required_paths,
+    validate_output_dir,
     validate_tokenizer_vocab,
 )
 
@@ -32,6 +34,7 @@ SFT_PRESETS: dict[str, tuple[str, str | None]] = {
     "smoltalk": ("HuggingFaceTB/smoltalk", "all"),
     "tulu3": ("allenai/tulu-3-sft-mixture", None),
 }
+_DEFAULT_SUBSET: Any = object()
 
 
 def _validate_sft_args(
@@ -58,7 +61,7 @@ def run_sft(
     tokenizer_path: str,
     output_dir: str,
     dataset_name: str = "HuggingFaceTB/smoltalk",
-    subset: str | None = "all",
+    subset: str | None = _DEFAULT_SUBSET,
     seq_len: int = 4096,
     total_steps: int = 2000,
     micro_batch_size: int = 2,
@@ -75,7 +78,7 @@ def run_sft(
         tokenizer_path=tokenizer_path,
         output_dir=output_dir,
     )
-    subset = normalize_optional_subset(subset)
+    validate_output_dir(output_dir)
     _validate_sft_args(
         seq_len=seq_len,
         total_steps=total_steps,
@@ -87,6 +90,18 @@ def run_sft(
         dataset_name=dataset_name,
         require_dataset=examples_override is None,
     )
+    if subset is _DEFAULT_SUBSET:
+        resolved_subset = (
+            "all" if (isinstance(dataset_name, str) and dataset_name.strip() == "HuggingFaceTB/smoltalk") else None
+        )
+    else:
+        resolved_subset = normalize_optional_subset(subset)
+    if examples_override is not None:
+        if not examples_override:
+            raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
+        if not all(is_chatml_messages(ex) for ex in examples_override):
+            raise ValueError("All examples_override items must be non-empty ChatML {'role', 'content'} message lists.")
+        examples = examples_override
     torch.manual_seed(seed)
     device = get_device()
     use_bf16 = bf16 and bf16_supported(device)
@@ -99,12 +114,8 @@ def run_sft(
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
 
-    if examples_override is not None:
-        if not all(is_chatml_messages(ex) for ex in examples_override):
-            raise ValueError("All examples_override items must be non-empty ChatML {'role', 'content'} message lists.")
-        examples = examples_override
-    else:
-        raw = load_dataset(dataset_name.strip(), subset, split="train", streaming=True)
+    if examples_override is None:
+        raw = load_dataset(dataset_name.strip(), resolved_subset, split="train", streaming=True)
         examples = []
         for row in raw:
             msgs = row.get("messages")
@@ -112,9 +123,8 @@ def run_sft(
                 examples.append(msgs)
                 if len(examples) >= max_examples:
                     break
-
-    if not examples:
-        raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
+        if not examples:
+            raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
 
     ds = SFTDataset(examples, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
     if not any(bool((ds[i][1] != -100).any()) for i in range(len(ds))):
@@ -200,6 +210,7 @@ def main() -> None:
                 "--output-dir": args.output_dir,
             }
         )
+        validate_output_dir(output_dir)
     except ValueError as exc:
         parser.error(str(exc))
     norm_sub = normalize_optional_subset(args.subset)

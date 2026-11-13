@@ -19,8 +19,10 @@ from crouton.train.common import (
     get_device,
     instantiate_checkpoint_model,
     load_checkpoint_payload,
+    read_nonempty_lines,
     safe_decode,
     strip_required_paths,
+    validate_output_dir,
     validate_tokenizer_vocab,
 )
 
@@ -129,7 +131,8 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         parts: list[str] = []
         for msg in chat_history:
             role = str(msg.get("role", "user")).strip() or "user"
-            content = str(msg.get("content", ""))
+            raw_content = msg.get("content")
+            content = "" if raw_content is None else str(raw_content)
             parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
         if add_generation_prompt:
             parts.append("<|im_start|>assistant\n")
@@ -382,8 +385,9 @@ def evaluate_lm_eval(
 ) -> dict[str, Any]:
     if batch_size < 1 or (limit is not None and limit < 1):
         raise ValueError("batch_size and limit must be >= 1")
-    if not tasks:
-        raise ValueError("tasks must be non-empty")
+    if not tasks or any(not isinstance(t, str) or not t.strip() for t in tasks):
+        raise ValueError("tasks must contain at least one non-empty task name")
+    clean_tasks = [t.strip() for t in tasks]
     if not HAS_LM_EVAL:
         raise RuntimeError("lm-eval is not installed. Install with: uv sync --extra dev --extra eval")
     checkpoint_path, tokenizer_path = strip_required_paths(
@@ -391,7 +395,7 @@ def evaluate_lm_eval(
         tokenizer_path=tokenizer_path,
     )
     lm = CroutonLM(checkpoint_path=checkpoint_path, tokenizer_path=tokenizer_path, batch_size=batch_size, bf16=bf16)
-    results = lm_eval.simple_evaluate(model=lm, tasks=tasks, limit=limit)
+    results = lm_eval.simple_evaluate(model=lm, tasks=clean_tasks, limit=limit)
     return results.get("results", {})
 
 
@@ -426,8 +430,13 @@ def main() -> None:
     if output_json is not None:
         if not output_json:
             parser.error("--output-json must be a non-empty path")
-        if Path(output_json).is_dir():
+        out_json_path = Path(output_json)
+        if out_json_path.is_dir() or (out_json_path.is_symlink() and not out_json_path.exists()):
             parser.error("--output-json must be a file path, not a directory")
+        try:
+            validate_output_dir(out_json_path.parent)
+        except ValueError as exc:
+            parser.error(f"--output-json parent directory is invalid: {exc}")
 
     if val_file is None and args.tasks is None:
         parser.error("Provide at least one of --val-file or --tasks")
@@ -442,11 +451,7 @@ def main() -> None:
         if not HAS_LM_EVAL:
             raise RuntimeError("lm-eval is not installed. Install with: uv sync --extra dev --extra eval")
 
-    texts: list[str] | None = None
-    if val_file is not None:
-        texts = [line.strip() for line in Path(val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not texts:
-            raise ValueError(f"Validation file {val_file!r} contains no non-empty lines")
+    texts: list[str] | None = read_nonempty_lines(val_file, label="Validation file") if val_file is not None else None
 
     # Pre-validate tokenizer and both checkpoints before running potentially long evaluations.
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)

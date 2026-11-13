@@ -296,3 +296,53 @@ def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
     tok_cli.main()
     assert seen["sources"] == [("custom/ds", None, "train", "text")]
     assert out_tok.exists()
+
+    # Non-default --split / --text-field without --dataset must fail instead of being silently ignored
+    for bad_argv in (
+        ["crouton-train-tokenizer", "--split", "validation"],
+        ["crouton-train-tokenizer", "--text-field", "body"],
+    ):
+        monkeypatch.setattr(sys, "argv", bad_argv)
+        with pytest.raises(SystemExit):
+            tok_cli.main()
+
+    # Output path filesystem conflicts must fail before HF streaming or BPE training
+    conflict_dir = tmp_path / "dir_as_json.json"
+    conflict_dir.mkdir()
+    conflict_file = tmp_path / "file_as_dir"
+    conflict_file.write_text("occupied\n", encoding="utf-8")
+    monkeypatch.setattr(
+        tok_cli,
+        "iter_hf_corpus",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should fail output validation before streaming")),
+    )
+    for bad_out in (str(conflict_dir), str(conflict_file), str(conflict_file / "tok.json")):
+        monkeypatch.setattr(sys, "argv", ["crouton-train-tokenizer", "--output", bad_out])
+        with pytest.raises(SystemExit):
+            tok_cli.main()
+        with pytest.raises(ValueError, match="directory"):
+            train_crouton_tokenizer(["hello world"], output_path=bad_out, vocab_size=260)
+
+    # Whitespace-padded ChatML role matches supervision rules consistently across SFT & DPO
+    tok = WpBpePpigTokenizer.from_pretrained(str(out_tok))
+    x_ws, y_ws, _ = format_chatml_sft_with_mask(
+        [{"role": "user", "content": "Hi"}, {"role": " assistant ", "content": "ok"}],
+        tok,
+        seq_len=32,
+        pad_to_max=False,
+    )
+    assert len(x_ws) == len(y_ws) and bool((y_ws != -100).any())
+    pref_ws = PreferenceDataset(
+        [
+            {
+                "prompt": "Hi",
+                "chosen": [{"role": " assistant ", "content": "yes"}],
+                "rejected": [{"role": " assistant ", "content": "no"}],
+            }
+        ],
+        tok,
+        seq_len=32,
+        pad_to_max=False,
+    )[0]
+    assert bool((pref_ws["chosen_labels"] != -100).any())
+    assert bool((pref_ws["rejected_labels"] != -100).any())

@@ -19,7 +19,9 @@ from crouton.train.common import (
     evaluate_model_bpb,
     get_device,
     next_or_restart,
+    read_nonempty_lines,
     save_checkpoint,
+    validate_output_dir,
     validate_tokenizer_vocab,
 )
 
@@ -45,21 +47,14 @@ def run_pretrain(
 ) -> None:
     model_cfg.__post_init__()
     train_cfg.__post_init__()
+    validate_output_dir(train_cfg.output_dir)
     torch.manual_seed(train_cfg.seed)
     device = get_device()
     use_bf16 = train_cfg.bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    local_texts = None
-    if local_file is not None:
-        local_texts = [line.strip() for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not local_texts:
-            raise ValueError(f"Local training file {local_file!r} contains no non-empty lines")
-    val_texts = None
-    if val_file is not None:
-        val_texts = [line.strip() for line in Path(val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not val_texts:
-            raise ValueError(f"Validation file {val_file!r} contains no non-empty lines")
+    local_texts = read_nonempty_lines(local_file, label="Local training file") if local_file is not None else None
+    val_texts = read_nonempty_lines(val_file, label="Validation file") if val_file is not None else None
 
     tokenizer = WpBpePpigTokenizer.from_pretrained(train_cfg.tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
@@ -178,6 +173,7 @@ def main() -> None:
     if args.seq_len is not None and args.seq_len < 1:
         parser.error("--seq-len must be >= 1")
     try:
+        validate_output_dir(output_dir)
         train_cfg = TrainConfig(
             output_dir=output_dir,
             tokenizer_path=tokenizer_path,
@@ -197,10 +193,6 @@ def main() -> None:
         )
     except ValueError as exc:
         parser.error(str(exc))
-
-    for label, fpath in (("Local training", local_file), ("Validation", val_file)):
-        if fpath is not None and not [line for line in Path(fpath).read_text(encoding="utf-8").splitlines() if line.strip()]:
-            raise ValueError(f"{label} file {fpath!r} contains no non-empty lines")
 
     model_cfg = CroutonConfig.from_yaml(model_config_path)
     if args.vocab_size is not None:

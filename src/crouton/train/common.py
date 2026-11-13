@@ -48,6 +48,36 @@ def strip_required_paths(**named_paths: str) -> tuple[str, ...]:
     return tuple(cleaned)
 
 
+def validate_output_dir(output_dir: str | Path) -> Path:
+    """Validate that output_dir and its existing ancestors are directories, not regular files or broken symlinks."""
+    if isinstance(output_dir, str):
+        (clean_dir,) = strip_required_paths(output_dir=output_dir)
+        out = Path(clean_dir)
+    elif isinstance(output_dir, Path) and str(output_dir).strip():
+        out = output_dir
+    else:
+        raise ValueError("output_dir must be non-empty")
+    for candidate in (out, *out.parents):
+        if (candidate.exists() and not candidate.is_dir()) or (candidate.is_symlink() and not candidate.exists()):
+            raise ValueError(f"Output directory path {str(candidate)!r} exists and is not a directory")
+    return out
+
+
+def read_nonempty_lines(path: str | Path, label: str = "Text file") -> list[str]:
+    """Validate path, read UTF-8 text lines, and reject empty/whitespace-only files."""
+    if isinstance(path, str):
+        (clean_path,) = strip_required_paths(**{label: path})
+        fpath = Path(clean_path)
+    elif isinstance(path, Path) and str(path).strip():
+        fpath = path
+    else:
+        raise ValueError(f"{label} must be non-empty")
+    lines = [line.strip() for line in fpath.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"{label} {str(fpath)!r} contains no non-empty lines")
+    return lines
+
+
 def validate_tokenizer_vocab(tokenizer, model_cfg: CroutonConfig) -> None:
     """Fail fast if the tokenizer produces IDs beyond the model embedding table."""
     if tokenizer.vocab_size > model_cfg.vocab_size:
@@ -190,15 +220,22 @@ def load_checkpoint_payload(
     override_rope_scaling_type: str | None = None,
 ) -> tuple[dict[str, Any], CroutonConfig, int]:
     """Load checkpoint payload, validated CroutonConfig, and model state schema on CPU before GPU/network setup."""
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(path, str):
+        (clean_path,) = strip_required_paths(checkpoint_path=path)
+        ckpt_path: str | Path = clean_path
+    elif isinstance(path, Path) and str(path).strip():
+        ckpt_path = path
+    else:
+        raise ValueError("checkpoint_path must be non-empty")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if not isinstance(ckpt, dict):
-        raise ValueError(f"Checkpoint {path!r} payload must be a dict, got {type(ckpt).__name__}")
+        raise ValueError(f"Checkpoint {ckpt_path!r} payload must be a dict, got {type(ckpt).__name__}")
     raw_cfg = ckpt.get("config")
     raw_model = ckpt.get("model")
     if not isinstance(raw_cfg, dict):
-        raise ValueError(f"Checkpoint {path!r} is missing a valid 'config' dict")
+        raise ValueError(f"Checkpoint {ckpt_path!r} is missing a valid 'config' dict")
     if not isinstance(raw_model, dict) or not raw_model or not all(isinstance(k, str) for k in raw_model):
-        raise ValueError(f"Checkpoint {path!r} is missing a valid 'model' state_dict")
+        raise ValueError(f"Checkpoint {ckpt_path!r} is missing a valid 'model' state_dict")
     cfg_dict = dict(raw_cfg)
     if "rope_original_max_seq_len" not in cfg_dict:
         cfg_dict["rope_original_max_seq_len"] = cfg_dict.get("max_seq_len", 2048)
@@ -208,7 +245,10 @@ def load_checkpoint_payload(
         cfg_dict["rope_scale_factor"] = override_rope_scale
     if override_rope_scaling_type is not None:
         cfg_dict["rope_scaling_type"] = override_rope_scaling_type
-    cfg = CroutonConfig(**cfg_dict)
+    try:
+        cfg = CroutonConfig(**cfg_dict)
+    except TypeError as exc:
+        raise ValueError(f"Checkpoint {ckpt_path!r} contains invalid CroutonConfig fields: {exc}") from exc
     clean_sd = strip_orig_mod_prefix(raw_model)
     with torch.device("meta"):
         expected_sd = CroutonForCausalLM(cfg).state_dict()
@@ -216,17 +256,27 @@ def load_checkpoint_payload(
         missing = sorted(expected_sd.keys() - clean_sd.keys())
         unexpected = sorted(clean_sd.keys() - expected_sd.keys())
         raise ValueError(
-            f"Checkpoint {path!r} state_dict keys do not match CroutonConfig "
+            f"Checkpoint {ckpt_path!r} state_dict keys do not match CroutonConfig "
             f"(missing={missing[:5]}, unexpected={unexpected[:5]})"
         )
     for k, expected_t in expected_sd.items():
         actual_t = clean_sd[k]
         if not isinstance(actual_t, torch.Tensor) or tuple(actual_t.shape) != tuple(expected_t.shape):
             raise ValueError(
-                f"Checkpoint {path!r} tensor {k!r} shape mismatch: expected {tuple(expected_t.shape)}, got "
+                f"Checkpoint {ckpt_path!r} tensor {k!r} shape mismatch: expected {tuple(expected_t.shape)}, got "
                 f"{tuple(actual_t.shape) if isinstance(actual_t, torch.Tensor) else type(actual_t).__name__}"
             )
-    return ckpt, cfg, int(ckpt.get("step", 0))
+    raw_step = ckpt.get("step", 0)
+    if raw_step is None:
+        step = 0
+    elif isinstance(raw_step, bool) or (isinstance(raw_step, float) and not raw_step.is_integer()):
+        raise ValueError(f"Checkpoint {ckpt_path!r} has invalid 'step' value {raw_step!r}")
+    else:
+        try:
+            step = int(raw_step)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Checkpoint {ckpt_path!r} has invalid 'step' value {raw_step!r}") from exc
+    return ckpt, cfg, step
 
 
 def instantiate_checkpoint_model(

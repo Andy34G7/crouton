@@ -1017,3 +1017,254 @@ def test_sequence_logps_early_validation_cli_and_eval_guards(tmp_path, monkeypat
         assert len(gsm_tasks) == 1
         assert "1+1?" in gsm_tasks[0][0] and "None" not in gsm_tasks[0][0]
         assert gsm_tasks[0][1]("#### 2") == 1.0
+
+
+def test_loop8_validation_and_consistency(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+
+    from crouton.eval import eval_runner as eval_mod, evaluate_lm_eval
+    from crouton.train import dpo as dpo_mod, grpo as grpo_mod, midtrain as mid_mod, pretrain as pre_mod, sft as sft_mod
+    from crouton.train.common import load_checkpoint_payload
+
+    tok_path = tmp_path / "tok.json"
+    tok = train_crouton_tokenizer(
+        ["Dense MoE transformer training corpus with numbers 12345 and text. " * 25],
+        output_path=tok_path,
+        vocab_size=300,
+        min_frequency=1,
+    )
+    cfg = _tiny_cfg()
+    cfg.vocab_size = tok.vocab_size
+    cfg.max_seq_len = 32
+    cfg.rope_original_max_seq_len = 32
+    ckpt_ok = tmp_path / "ckpt.pt"
+    save_checkpoint(ckpt_ok, CroutonForCausalLM(cfg), cfg, step=2)
+
+    val_file = tmp_path / "val.txt"
+    val_file.write_text("Hello world\nSecond line\n", encoding="utf-8")
+    conflict_file = tmp_path / "occupied_file"
+    conflict_file.write_text("not a directory\n", encoding="utf-8")
+
+    # 1. midtrain --split / --text-field require --dataset and cannot combine non-default values with local_file
+    for bad_argv in (
+        ["crouton-midtrain", "--base-checkpoint", str(ckpt_ok), "--split", "validation"],
+        ["crouton-midtrain", "--base-checkpoint", str(ckpt_ok), "--text-field", "body"],
+    ):
+        monkeypatch.setattr(sys, "argv", bad_argv)
+        with pytest.raises(SystemExit):
+            mid_mod.main()
+    with pytest.raises(ValueError, match="require dataset_name"):
+        run_midtrain(
+            str(ckpt_ok),
+            str(tok_path),
+            str(tmp_path / "mid_bad"),
+            seq_len=16,
+            total_steps=1,
+            split="validation",
+            bf16=False,
+        )
+    with pytest.raises(ValueError, match="local_file"):
+        run_midtrain(
+            str(ckpt_ok),
+            str(tok_path),
+            str(tmp_path / "mid_bad"),
+            seq_len=16,
+            total_steps=1,
+            local_file=str(val_file),
+            split="validation",
+            bf16=False,
+        )
+
+    # 2. run_pretrain strips/rejects blank local_file / val_file and main() validates model_config before reading files
+    bad_tcfg = TrainConfig(
+        output_dir=str(tmp_path / "pre_out"),
+        tokenizer_path=str(tok_path),
+        seq_len=16,
+        total_steps=1,
+        micro_batch_size=1,
+        grad_accum_steps=1,
+        bf16=False,
+        compile_model=False,
+    )
+    with pytest.raises(ValueError, match="non-empty"):
+        run_pretrain(cfg, bad_tcfg, local_file="   ")
+    with pytest.raises(ValueError, match="non-empty"):
+        run_pretrain(cfg, bad_tcfg, val_file="")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "crouton-pretrain",
+            "--model-config",
+            str(tmp_path / "missing_cfg.yaml"),
+            "--val-file",
+            str(tmp_path / "missing_val.txt"),
+        ],
+    )
+    with pytest.raises(FileNotFoundError, match="missing_cfg"):
+        pre_mod.main()
+
+    # 3. run_sft defaults subset=None for custom datasets while preserving subset="all" for smoltalk
+    seen_sft_calls: list[tuple[str, object]] = []
+
+    def _capture_sft_ds(name, subset=None, **kw):
+        seen_sft_calls.append((name, subset))
+        return []
+
+    with monkeypatch.context() as mp:
+        mp.setattr(sft_mod, "load_dataset", _capture_sft_ds)
+        with pytest.raises(ValueError, match="zero valid"):
+            run_sft(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "sft_custom"),
+                dataset_name="allenai/tulu-3-sft-mixture",
+                seq_len=16,
+                total_steps=1,
+                bf16=False,
+            )
+        with pytest.raises(ValueError, match="zero valid"):
+            run_sft(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "sft_default"),
+                seq_len=16,
+                total_steps=1,
+                bf16=False,
+            )
+    assert seen_sft_calls == [
+        ("allenai/tulu-3-sft-mixture", None),
+        ("HuggingFaceTB/smoltalk", "all"),
+    ]
+
+    # 4. Output path file conflicts fail upfront across all 5 training APIs, CLIs, and eval --output-json
+    for bad_out in (str(conflict_file), str(conflict_file / "nested")):
+        bad_out_cfg = TrainConfig(
+            output_dir=bad_out,
+            tokenizer_path=str(tok_path),
+            seq_len=16,
+            total_steps=1,
+            micro_batch_size=1,
+            grad_accum_steps=1,
+            bf16=False,
+            compile_model=False,
+        )
+        with pytest.raises(ValueError, match="not a directory"):
+            run_pretrain(cfg, bad_out_cfg, local_file=str(val_file))
+        with pytest.raises(ValueError, match="not a directory"):
+            run_midtrain(str(ckpt_ok), str(tok_path), bad_out, seq_len=16, total_steps=1, bf16=False)
+        with pytest.raises(ValueError, match="not a directory"):
+            run_sft(str(ckpt_ok), str(tok_path), bad_out, seq_len=16, total_steps=1, bf16=False)
+        with pytest.raises(ValueError, match="not a directory"):
+            run_preference_tuning(str(ckpt_ok), str(tok_path), bad_out, seq_len=16, total_steps=1, bf16=False)
+        with pytest.raises(ValueError, match="not a directory"):
+            run_grpo(str(ckpt_ok), str(tok_path), bad_out, prompts_with_verifiers=build_builtin_math_tasks(n=1), steps=1, max_new_tokens=4, bf16=False)
+
+    for cli_fn, argv in (
+        (pre_mod.main, ["crouton-pretrain", "--output-dir", str(conflict_file)]),
+        (mid_mod.main, ["crouton-midtrain", "--base-checkpoint", str(ckpt_ok), "--output-dir", str(conflict_file / "x")]),
+        (sft_mod.main, ["crouton-sft", "--base-checkpoint", str(ckpt_ok), "--output-dir", str(conflict_file)]),
+        (dpo_mod.main, ["crouton-dpo", "--base-checkpoint", str(ckpt_ok), "--output-dir", str(conflict_file)]),
+        (grpo_mod.main, ["crouton-grpo", "--base-checkpoint", str(ckpt_ok), "--output-dir", str(conflict_file)]),
+        (eval_mod.main, ["crouton-eval", "--checkpoint", str(ckpt_ok), "--val-file", str(val_file), "--output-json", str(conflict_file / "out.json")]),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit):
+            cli_fn()
+
+    # 5. load_checkpoint_payload rejects blank paths, unknown config fields, and invalid steps (handling step=None)
+    with pytest.raises(ValueError, match="non-empty"):
+        load_checkpoint_payload("   ")
+    with pytest.raises(ValueError, match="non-empty"):
+        load_checkpoint_payload(Path("   "))
+
+    ckpt_unknown_cfg = tmp_path / "unknown_cfg.pt"
+    raw_payload = torch.load(ckpt_ok, map_location="cpu", weights_only=False)
+    torch.save({"config": {**raw_payload["config"], "unknown_key": 1}, "model": raw_payload["model"]}, ckpt_unknown_cfg)
+    with pytest.raises(ValueError, match="CroutonConfig"):
+        load_checkpoint_payload(ckpt_unknown_cfg)
+
+    ckpt_none_step = tmp_path / "none_step.pt"
+    torch.save({"config": raw_payload["config"], "model": raw_payload["model"], "step": None}, ckpt_none_step)
+    _, _, parsed_step = load_checkpoint_payload(ckpt_none_step)
+    assert parsed_step == 0
+
+    ckpt_bad_step = tmp_path / "bad_step.pt"
+    torch.save({"config": raw_payload["config"], "model": raw_payload["model"], "step": "not_int"}, ckpt_bad_step)
+    with pytest.raises(ValueError, match="step"):
+        load_checkpoint_payload(ckpt_bad_step)
+
+    # 6. Malformed overrides fail BEFORE checkpoint load, evaluate_lm_eval rejects blank tasks, and grpo.main loads once
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            sft_mod,
+            "load_checkpoint_payload",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should reject malformed examples_override before load")),
+        )
+        with pytest.raises(ValueError, match="ChatML"):
+            run_sft(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "sft_bad_override"),
+                seq_len=16,
+                total_steps=1,
+                examples_override=[[{"role": "", "content": "bad"}]],
+            )
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            dpo_mod,
+            "load_checkpoint_payload",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should reject malformed pairs_override before load")),
+        )
+        with pytest.raises(ValueError, match="preference pair"):
+            run_preference_tuning(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "dpo_bad_override"),
+                seq_len=16,
+                total_steps=1,
+                pairs_override=[{"prompt": "p", "chosen": 123, "rejected": "no"}],
+            )
+
+    with pytest.raises(ValueError, match="task"):
+        evaluate_lm_eval(str(ckpt_ok), str(tok_path), tasks=["   "])
+
+    load_count = 0
+    orig_grpo_load = grpo_mod.load_checkpoint_payload
+
+    def _counting_load(*a, **kw):
+        nonlocal load_count
+        load_count += 1
+        return orig_grpo_load(*a, **kw)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(grpo_mod, "load_checkpoint_payload", _counting_load)
+        mp.setattr(
+            sys,
+            "argv",
+            [
+                "crouton-grpo",
+                "--base-checkpoint",
+                str(ckpt_ok),
+                "--tokenizer",
+                str(tok_path),
+                "--output-dir",
+                str(tmp_path / "grpo_once"),
+                "--builtin-math",
+                "--steps",
+                "1",
+                "--group-size",
+                "2",
+                "--max-new-tokens",
+                "4",
+                "--no-bf16",
+            ],
+        )
+        grpo_mod.main()
+    assert load_count == 1
+    assert (tmp_path / "grpo_once" / "final.pt").exists()
+
+    # 7. CroutonLM.apply_chat_template renders None content as empty string instead of "None"
+    lm = CroutonLM(str(ckpt_ok), str(tok_path), device="cpu")
+    rendered = lm.apply_chat_template([{"role": " assistant ", "content": None}], add_generation_prompt=True)
+    assert rendered == "<|im_start|>assistant\n<|im_end|>\n<|im_start|>assistant\n"

@@ -53,6 +53,22 @@ def read_local_corpus(path: str | Path) -> list[str]:
     return [line for line in text.splitlines() if line.strip()]
 
 
+def _validate_tokenizer_output_path(output_path: str | Path) -> Path:
+    out_str = str(output_path).strip() if isinstance(output_path, (str, Path)) else ""
+    if not out_str:
+        raise ValueError("output_path must be non-empty")
+    out = Path(out_str)
+    for parent in out.parents:
+        if (parent.exists() and not parent.is_dir()) or (parent.is_symlink() and not parent.exists()):
+            raise ValueError(f"Tokenizer output parent path {str(parent)!r} exists and is not a directory")
+    if out.suffix == ".json":
+        if out.is_dir() or (out.is_symlink() and not out.exists()):
+            raise ValueError(f"Tokenizer JSON output path {out_str!r} must be a file path, not a directory")
+    elif (out.exists() and not out.is_dir()) or (out.is_symlink() and not out.exists()):
+        raise ValueError(f"Tokenizer output directory {out_str!r} exists and is not a directory")
+    return out
+
+
 def train_crouton_tokenizer(
     corpus: list[str],
     output_path: str | Path,
@@ -62,9 +78,7 @@ def train_crouton_tokenizer(
     individual_digits: bool = True,
 ) -> WpBpePpigTokenizer:
     """Train WpBpePpigTokenizer with crouton pretokenizer and export to `output_path`."""
-    out_str = str(output_path).strip()
-    if not out_str:
-        raise ValueError("output_path must be non-empty")
+    out = _validate_tokenizer_output_path(output_path)
     if (
         vocab_size < MIN_VOCAB_SIZE
         or min_frequency < 1
@@ -90,7 +104,6 @@ def train_crouton_tokenizer(
         special_tokens=DEFAULT_SPECIAL_TOKENS,
         pretokenizer=pretokenizer,
     )
-    out = Path(out_str)
     if out.suffix == ".json":
         out.parent.mkdir(parents=True, exist_ok=True)
         tok.export_hf_json(str(out))
@@ -117,6 +130,10 @@ def main() -> None:
     output_path = args.output.strip()
     if not output_path:
         parser.error("--output must be non-empty")
+    try:
+        _validate_tokenizer_output_path(output_path)
+    except ValueError as exc:
+        parser.error(str(exc))
     if (
         args.vocab_size < MIN_VOCAB_SIZE
         or args.min_frequency < 1
@@ -129,21 +146,20 @@ def main() -> None:
         )
     if args.dataset is not None and not args.dataset.strip():
         parser.error("--dataset must be a non-empty dataset name")
-    if not args.split.strip() or not args.text_field.strip():
+    split = args.split.strip()
+    text_field = args.text_field.strip()
+    if not split or not text_field:
         parser.error("--split and --text-field must be non-empty")
     local_file = args.local_file.strip() if args.local_file is not None else None
     if local_file is not None:
         if not local_file:
             parser.error("--local-file must be a non-empty file path")
-        if (
-            args.dataset is not None
-            or args.subset is not None
-            or args.split != "train"
-            or args.text_field != "text"
-        ):
+        if args.dataset is not None or args.subset is not None or split != "train" or text_field != "text":
             parser.error("--local-file cannot be combined with --dataset, --subset, --split, or --text-field")
-    if args.subset is not None and args.dataset is None:
-        parser.error("--subset requires --dataset")
+    if args.dataset is None and local_file is None and (
+        args.subset is not None or split != "train" or text_field != "text"
+    ):
+        parser.error("--subset, non-default --split, and non-default --text-field require --dataset")
 
     if local_file is not None:
         corpus = read_local_corpus(local_file)
@@ -153,7 +169,7 @@ def main() -> None:
         raw_sub = args.subset.strip() if args.subset is not None else None
         subset = None if raw_sub in (None, "", "none", "None") else raw_sub
         corpus = iter_hf_corpus(
-            sources=[(args.dataset.strip(), subset, args.split.strip(), args.text_field.strip())],
+            sources=[(args.dataset.strip(), subset, split, text_field)],
             max_docs=args.max_docs,
         )
     else:

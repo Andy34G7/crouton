@@ -20,8 +20,10 @@ from crouton.train.common import (
     load_checkpoint_payload,
     next_or_restart,
     normalize_optional_subset,
+    read_nonempty_lines,
     save_checkpoint,
     strip_required_paths,
+    validate_output_dir,
     validate_tokenizer_vocab,
 )
 
@@ -63,10 +65,16 @@ def _validate_midtrain_args(
         raise ValueError("local_file must be non-empty when specified")
     if not isinstance(split, str) or not split.strip() or not isinstance(text_field, str) or not text_field.strip():
         raise ValueError("split and text_field must be non-empty")
-    if subset is not None and not dataset_name:
-        raise ValueError("subset requires dataset_name to be set")
-    if local_file is not None and (dataset_name is not None or subset is not None):
-        raise ValueError("local_file cannot be combined with dataset_name or subset")
+    clean_split = split.strip()
+    clean_text_field = text_field.strip()
+    if local_file is not None and (
+        dataset_name is not None or subset is not None or clean_split != "train" or clean_text_field != "text"
+    ):
+        raise ValueError("local_file cannot be combined with dataset_name, subset, split, or text_field")
+    if (subset is not None or clean_split != "train" or clean_text_field != "text") and not (
+        dataset_name is not None and dataset_name.strip()
+    ):
+        raise ValueError("subset, non-default split, and non-default text_field require dataset_name")
 
 
 def run_midtrain(
@@ -96,6 +104,7 @@ def run_midtrain(
         tokenizer_path=tokenizer_path,
         output_dir=output_dir,
     )
+    validate_output_dir(output_dir)
     subset = normalize_optional_subset(subset)
     _validate_midtrain_args(
         seq_len=seq_len,
@@ -118,11 +127,7 @@ def run_midtrain(
     text_field = text_field.strip()
     local_file = local_file.strip() if local_file is not None else None
 
-    local_texts = None
-    if local_file is not None:
-        local_texts = [line.strip() for line in Path(local_file).read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not local_texts:
-            raise ValueError(f"Local mid-training file {local_file!r} contains no non-empty lines")
+    local_texts = read_nonempty_lines(local_file, label="Local mid-training file") if local_file is not None else None
 
     torch.manual_seed(seed)
     device = get_device()
@@ -227,18 +232,19 @@ def main() -> None:
                 "--output-dir": args.output_dir,
             }
         )
+        validate_output_dir(output_dir)
     except ValueError as exc:
         parser.error(str(exc))
+    split = args.split.strip()
+    text_field = args.text_field.strip()
     local_file = args.local_file.strip() if args.local_file is not None else None
     if local_file is not None:
         if not local_file:
             parser.error("--local-file must be a non-empty file path")
-        if args.dataset is not None or args.subset is not None or args.split != "train" or args.text_field != "text":
+        if args.dataset is not None or args.subset is not None or split != "train" or text_field != "text":
             parser.error("--local-file cannot be combined with --dataset, --subset, --split, or --text-field")
     dataset_name = args.dataset.strip() if args.dataset is not None else None
     subset = normalize_optional_subset(args.subset)
-    split = args.split.strip()
-    text_field = args.text_field.strip()
     try:
         _validate_midtrain_args(
             seq_len=args.seq_len,

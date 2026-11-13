@@ -49,10 +49,13 @@ def _encode_chatml_messages(
     targets: list[int] = []
     im_start_ids = tokenizer.encode("<|im_start|>")
     im_end_nl_ids = tokenizer.encode("<|im_end|>\n")
-    last_assistant_idx = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+    last_assistant_idx = max(
+        (i for i, m in enumerate(messages) if str(m.get("role", "")).strip() == "assistant"),
+        default=-1,
+    )
 
     for idx, msg in enumerate(messages):
-        role = str(msg.get("role", "user"))
+        role = str(msg.get("role", "user")).strip() or "user"
         raw_content = msg.get("content")
         content = "" if raw_content is None else str(raw_content)
         header_ids = im_start_ids + tokenizer.encode(f"{role}\n", split_special_tokens=True)
@@ -272,7 +275,7 @@ class PreferenceDataset(Dataset):
                 raise ValueError("Preference response message list must be a non-empty list of {'role', 'content'} dicts")
             if is_chatml_messages(prompt) and response[: len(prompt)] != prompt:
                 return [*prompt, *response]
-            if isinstance(prompt, str) and prompt and response[0].get("role") == "assistant":
+            if isinstance(prompt, str) and prompt and str(response[0].get("role", "")).strip() == "assistant":
                 return [{"role": "user", "content": prompt}, *response]
             return response
         if is_chatml_messages(prompt):
@@ -322,7 +325,9 @@ class PreferenceDataset(Dataset):
             r_tail = r_msgs[common_k:]
 
             is_single_asst = (
-                len(c_tail) == 1 and len(r_tail) == 1 and c_tail[0].get("role") == r_tail[0].get("role") == "assistant"
+                len(c_tail) == 1
+                and len(r_tail) == 1
+                and str(c_tail[0].get("role", "")).strip() == str(r_tail[0].get("role", "")).strip() == "assistant"
             )
             if is_single_asst:
                 hdr = self.tokenizer.encode("<|im_start|>") + self.tokenizer.encode("assistant\n", split_special_tokens=True)

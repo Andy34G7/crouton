@@ -8,13 +8,14 @@ import random
 import re
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
 from tokenisers import WpBpePpigTokenizer
 from torch.optim import AdamW
 
+from crouton.config import CroutonConfig
 from crouton.data.pretrain_data import resolve_token_id
 from crouton.train.common import (
     bf16_supported,
@@ -24,6 +25,7 @@ from crouton.train.common import (
     safe_decode,
     save_checkpoint,
     strip_required_paths,
+    validate_output_dir,
     validate_tokenizer_vocab,
 )
 
@@ -211,12 +213,14 @@ def run_grpo(
     bf16: bool = True,
     save_interval: int = 0,
     seed: int = 42,
+    _preloaded: tuple[dict[str, Any], CroutonConfig, WpBpePpigTokenizer] | None = None,
 ) -> None:
     base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
         base_checkpoint=base_checkpoint,
         tokenizer_path=tokenizer_path,
         output_dir=output_dir,
     )
+    validate_output_dir(output_dir)
     if not prompts_with_verifiers:
         raise ValueError("prompts_with_verifiers must be non-empty")
     _validate_grpo_args(
@@ -234,12 +238,15 @@ def run_grpo(
     use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint)
+    if _preloaded is not None:
+        ckpt, model_cfg, tokenizer = _preloaded
+    else:
+        ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint)
+        tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     if max_new_tokens >= model_cfg.max_seq_len:
         raise ValueError(
             f"max_new_tokens ({max_new_tokens}) must be < model max_seq_len ({model_cfg.max_seq_len})"
         )
-    tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
 
     policy = instantiate_checkpoint_model(ckpt, model_cfg, device)
@@ -351,13 +358,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    base_checkpoint = args.base_checkpoint.strip()
-    tokenizer_path = args.tokenizer.strip()
-    output_dir = args.output_dir.strip()
-    if not base_checkpoint or not tokenizer_path or not output_dir:
-        parser.error("--base-checkpoint, --tokenizer, and --output-dir must be non-empty")
-
     try:
+        base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
+            **{
+                "--base-checkpoint": args.base_checkpoint,
+                "--tokenizer": args.tokenizer,
+                "--output-dir": args.output_dir,
+            }
+        )
+        validate_output_dir(output_dir)
         _validate_grpo_args(
             group_size=args.group_size,
             steps=args.steps,
@@ -372,10 +381,11 @@ def main() -> None:
         parser.error(str(exc))
 
     # Validate checkpoint config, max_new_tokens bound, and tokenizer before HF GSM8K streaming.
-    _, cfg, _ = load_checkpoint_payload(base_checkpoint)
+    ckpt, cfg, _ = load_checkpoint_payload(base_checkpoint)
     if args.max_new_tokens >= cfg.max_seq_len:
         raise ValueError(f"max_new_tokens ({args.max_new_tokens}) must be < model max_seq_len ({cfg.max_seq_len})")
-    validate_tokenizer_vocab(WpBpePpigTokenizer.from_pretrained(tokenizer_path), cfg)
+    tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+    validate_tokenizer_vocab(tokenizer, cfg)
 
     tasks = (
         build_builtin_math_tasks(n=max(args.steps, 64), seed=args.seed)
@@ -396,6 +406,7 @@ def main() -> None:
         bf16=not args.no_bf16,
         save_interval=args.save_interval,
         seed=args.seed,
+        _preloaded=(ckpt, cfg, tokenizer),
     )
 
 
