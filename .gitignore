@@ -23,11 +23,11 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 
-checkpoints/
-artifacts/
-data/
-runs/
-wandb/
+/checkpoints/
+/artifacts/
+/data/
+/runs/
+/wandb/
 *.pt
 *.safetensors
 *.bin
