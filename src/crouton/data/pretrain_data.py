@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import itertools
 from typing import Iterator
 
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 def resolve_token_id(tokenizer, token: str, fallback: int = 0) -> int:
@@ -21,6 +20,7 @@ class StreamingPackedDataset(IterableDataset):
     """
     Streams text documents from HuggingFace datasets (or local texts),
     encodes with wp-bpe-ppig, appends EOS, and packs into fixed (seq_len + 1) chunks.
+    Supports multi-worker DataLoader sharding and terminates cleanly on stream exhaustion.
     """
 
     def __init__(
@@ -42,27 +42,43 @@ class StreamingPackedDataset(IterableDataset):
         self.eos_id = resolve_token_id(tokenizer, eos_token, fallback=0)
 
     def _iter_texts(self) -> Iterator[str]:
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+
         if self.local_texts is not None:
+            if not self.local_texts:
+                return
+            doc_idx = 0
             while True:
                 for t in self.local_texts:
-                    yield t
-            return
+                    if doc_idx % num_workers == worker_id and t.strip():
+                        yield t
+                    doc_idx += 1
 
         from datasets import load_dataset
 
-        iters = []
-        for name, subset, split, field in self.sources:
-            ds = load_dataset(name, subset, split=split, streaming=True)
-            iters.append((row.get(field, "") for row in ds))
+        iters = [iter(load_dataset(name, subset, split=split, streaming=True)) for name, subset, split, _ in self.sources]
+        fields = [field for _, _, _, field in self.sources]
+        exhausted: set[int] = set()
+        step = 0
+        doc_idx = 0
 
-        # Round-robin across sources indefinitely
-        for gen in itertools.cycle(iters):
-            try:
-                text = next(gen)
-            except StopIteration:
+        while len(exhausted) < len(iters):
+            stream_i = step % len(iters)
+            step += 1
+            if stream_i in exhausted:
                 continue
+            try:
+                row = next(iters[stream_i])
+            except StopIteration:
+                exhausted.add(stream_i)
+                continue
+            text = row.get(fields[stream_i], "")
             if isinstance(text, str) and text.strip():
-                yield text
+                if doc_idx % num_workers == worker_id:
+                    yield text
+                doc_idx += 1
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         buf: list[int] = []

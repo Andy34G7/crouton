@@ -18,6 +18,8 @@ def format_chatml_sft_with_mask(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Encode a multi-turn conversation in ChatML format with assistant-only loss masking.
+    When an example exceeds `seq_len + 1` tokens, prefers keeping assistant supervision
+    (left-truncating long prompts) so targets never collapse to all -100 when avoidable.
     Returns (input_ids, targets, attention_mask) each of shape [seq_len].
     """
     pad_id = resolve_token_id(tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0))
@@ -42,8 +44,23 @@ def format_chatml_sft_with_mask(
         else:
             targets.extend([-100] * len(body_ids))
 
-    input_ids = input_ids[: seq_len + 1]
-    targets = targets[: seq_len + 1]
+    max_tokens = seq_len + 1
+    if len(input_ids) > max_tokens:
+        # Left-truncate when the tail contains supervised assistant tokens; otherwise slice around last supervised token.
+        tail_targets = targets[-max_tokens:]
+        if any(t != -100 for t in tail_targets[1:]):
+            input_ids = input_ids[-max_tokens:]
+            targets = tail_targets
+        else:
+            last_sup = max((i for i, t in enumerate(targets) if t != -100), default=-1)
+            if last_sup >= 0:
+                end = last_sup + 1
+                start = max(0, end - max_tokens)
+                input_ids = input_ids[start:end]
+                targets = targets[start:end]
+            else:
+                input_ids = input_ids[:max_tokens]
+                targets = targets[:max_tokens]
 
     x = input_ids[:-1]
     y = targets[1:]

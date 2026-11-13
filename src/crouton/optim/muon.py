@@ -97,22 +97,30 @@ def build_optimizers(
     """
     Partition parameters into Muon (2D block linear weights, excluding router/head/emb)
     and AdamW (embeddings, norms, router, 3D LoRA expert tensors).
+    Handles torch.compile OptimizedModule `_orig_mod.` prefixes transparently.
     """
     muon_params: list[torch.nn.Parameter] = []
     adamw_decay: list[torch.nn.Parameter] = []
     adamw_nodecay: list[torch.nn.Parameter] = []
+    has_blocks = False
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        is_emb_or_head = "tok_emb" in name or "lm_head" in name
-        is_router = "router" in name
-        if p.ndim == 2 and name.startswith("blocks.") and not is_router and not is_emb_or_head:
+        clean_name = name.removeprefix("_orig_mod.").removeprefix("module.")
+        if clean_name.startswith("blocks."):
+            has_blocks = True
+        is_emb_or_head = "tok_emb" in clean_name or "lm_head" in clean_name
+        is_router = "router" in clean_name
+        if p.ndim == 2 and clean_name.startswith("blocks.") and not is_router and not is_emb_or_head:
             muon_params.append(p)
         elif p.ndim >= 2 and not is_emb_or_head:
             adamw_decay.append(p)
         else:
             adamw_nodecay.append(p)
+
+    if has_blocks and not muon_params:
+        raise RuntimeError("No 2D block parameters matched Muon routing; check parameter naming.")
 
     muon_opt = Muon(muon_params, lr=muon_lr, weight_decay=weight_decay)
     adamw_opt = AdamW(
