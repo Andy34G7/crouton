@@ -671,3 +671,211 @@ def test_utils_and_cli_edge_cases(tmp_path, monkeypatch):
     lit = "Dense <|im_end|> MoE <|endoftext|> test."
     bpb_lit = evaluate_bpb(ckpt_file, str(tok_path), [lit], seq_len=32, bf16=False)
     assert int(bpb_lit["tokens"]) == len(tok.encode(lit, split_special_tokens=True))
+
+
+def test_sequence_logps_early_validation_cli_and_eval_guards(tmp_path, monkeypatch):
+    import torch.nn.functional as F
+    from crouton.eval import eval_runner as eval_mod
+    from crouton.train import dpo as dpo_mod
+    from crouton.train import grpo as grpo_mod
+    from crouton.train import midtrain as midtrain_mod
+    from crouton.train import pretrain as pretrain_mod
+    from crouton.train import sft as sft_mod
+    from crouton.train.common import save_checkpoint
+    from crouton.train.dpo import sequence_logps
+
+    # 1. sequence_logps matches naive fp32 log_softmax+gather across sparse & all-(-100) rows
+    torch.manual_seed(0)
+    logits = torch.randn(3, 10, 19, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.tensor(
+        [
+            [-100, -100, 1, 5, -100, 2, 0, -100, 18, -100],
+            [-100] * 10,
+            [3, 4, 7, -100, -100, -100, -100, -100, -100, -100],
+        ],
+        dtype=torch.long,
+    )
+    out = sequence_logps(logits, labels)
+    ref_logits = logits.detach().clone().float().requires_grad_(True)
+    ref_per_tok = F.log_softmax(ref_logits, dim=-1).gather(-1, labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    ref_out = (ref_per_tok * (labels != -100).float()).sum(dim=-1)
+    assert out.dtype == torch.float32
+    assert torch.allclose(out, ref_out, atol=1e-4)
+    out.sum().backward()
+    ref_out.sum().backward()
+    assert logits.grad is not None and torch.allclose(logits.grad.float(), ref_logits.grad, atol=1e-2)
+
+    all_masked_logits = torch.randn(2, 5, 11, dtype=torch.bfloat16, requires_grad=True)
+    all_masked_labels = torch.full((2, 5), -100, dtype=torch.long)
+    zero_out = sequence_logps(all_masked_logits, all_masked_labels)
+    assert torch.equal(zero_out, torch.zeros(2, dtype=torch.float32))
+    zero_out.sum().backward()
+    assert all_masked_logits.grad is not None and torch.equal(all_masked_logits.grad, torch.zeros_like(all_masked_logits))
+
+    # Build a tiny valid tokenizer and checkpoints for early-validation & ORPO smoke tests
+    corpus = "Dense MoE transformer training text. " * 20
+    tok_path = tmp_path / "tok.json"
+    tok = train_crouton_tokenizer([corpus], output_path=tok_path, vocab_size=260)
+    cfg = CroutonConfig(
+        vocab_size=tok.vocab_size,
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        n_experts=2,
+        expert_rank=4,
+        max_seq_len=32,
+        sliding_window=8,
+        sink_tokens=2,
+        global_layer_interval=2,
+        use_flex_attention=False,
+    )
+    model = CroutonForCausalLM(cfg)
+    ckpt_ok = tmp_path / "ok.pt"
+    save_checkpoint(str(ckpt_ok), model, cfg, step=0)
+
+    cfg_bad = CroutonConfig(
+        vocab_size=max(1, tok.vocab_size - 32),
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        n_experts=2,
+        expert_rank=4,
+        max_seq_len=32,
+        sliding_window=8,
+        sink_tokens=2,
+        global_layer_interval=2,
+        use_flex_attention=False,
+    )
+    ckpt_bad = tmp_path / "bad_vocab.pt"
+    save_checkpoint(str(ckpt_bad), CroutonForCausalLM(cfg_bad), cfg_bad, step=0)
+
+    # 2. run_sft and run_preference_tuning fail on malformed overrides BEFORE model allocation
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            sft_mod,
+            "instantiate_checkpoint_model",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not allocate model")),
+        )
+        with pytest.raises(ValueError, match="ChatML"):
+            run_sft(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "sft_bad"),
+                seq_len=16,
+                total_steps=1,
+                micro_batch_size=1,
+                grad_accum_steps=1,
+                bf16=False,
+                examples_override=[[{"bad": "shape"}]],
+            )
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            dpo_mod,
+            "instantiate_checkpoint_model",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not allocate model")),
+        )
+        with pytest.raises(ValueError, match="preference pair"):
+            run_preference_tuning(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "dpo_bad"),
+                seq_len=16,
+                total_steps=1,
+                micro_batch_size=1,
+                grad_accum_steps=1,
+                bf16=False,
+                pairs_override=[{"prompt": ["bad"], "chosen": "ok", "rejected": "no"}],
+            )
+
+    # 3. Smoke-test both DPO (with reference model reordering) and ORPO end-to-end
+    pref_pairs = [{"prompt": "What is 1+1?", "chosen": "2", "rejected": "9"}]
+    for use_orpo, name in ((False, "dpo_run"), (True, "orpo_run")):
+        out_dir = tmp_path / name
+        run_preference_tuning(
+            str(ckpt_ok),
+            str(tok_path),
+            str(out_dir),
+            seq_len=24,
+            total_steps=1,
+            micro_batch_size=1,
+            grad_accum_steps=1,
+            use_orpo=use_orpo,
+            bf16=False,
+            pairs_override=pref_pairs,
+        )
+        assert (out_dir / "final.pt").exists()
+
+    # 4. CLI whitespace --subset normalization and empty path fail-fast
+    seen_mid: dict[str, object] = {}
+    with monkeypatch.context() as mp:
+        mp.setattr(midtrain_mod, "run_midtrain", lambda **kw: seen_mid.update(kw))
+        mp.setattr(sys, "argv", ["crouton-midtrain", "--base-checkpoint", str(ckpt_ok), "--dataset", "custom/ds", "--subset", "   "])
+        midtrain_mod.main()
+        assert seen_mid["dataset_name"] == "custom/ds"
+        assert seen_mid["subset"] is None
+
+    seen_dpo: dict[str, object] = {}
+    with monkeypatch.context() as mp:
+        mp.setattr(dpo_mod, "run_preference_tuning", lambda **kw: seen_dpo.update(kw))
+        mp.setattr(sys, "argv", ["crouton-dpo", "--base-checkpoint", str(ckpt_ok), "--subset", "   "])
+        dpo_mod.main()
+        assert seen_dpo["subset"] is None
+
+    for fn, bad_argv in (
+        (pretrain_mod.main, ["crouton-pretrain", "--model-config", ""]),
+        (pretrain_mod.main, ["crouton-pretrain", "--model-config", "m.yaml", "--val-file", "   "]),
+        (pretrain_mod.main, ["crouton-pretrain", "--model-config", "m.yaml", "--local-file", ""]),
+        (midtrain_mod.main, ["crouton-midtrain", "--base-checkpoint", "   "]),
+        (sft_mod.main, ["crouton-sft", "--base-checkpoint", "   "]),
+        (dpo_mod.main, ["crouton-dpo", "--base-checkpoint", "   "]),
+        (grpo_mod.main, ["crouton-grpo", "--base-checkpoint", "   "]),
+        (grpo_mod.main, ["crouton-grpo", "--base-checkpoint", str(ckpt_ok), "--output-dir", "   "]),
+    ):
+        monkeypatch.setattr(sys, "argv", bad_argv)
+        with pytest.raises(SystemExit):
+            fn()
+
+    # 5. eval_runner early validation and compare-checkpoint pre-validation ordering
+    with pytest.raises(ValueError, match="seq_len must be >= 1"):
+        evaluate_bpb(str(tmp_path / "nonexistent.pt"), str(tok_path), ["hello"], seq_len=0, bf16=False)
+    with pytest.raises(ValueError, match="Evaluation texts"):
+        evaluate_bpb(str(tmp_path / "nonexistent.pt"), str(tok_path), ["   \n"], seq_len=16, bf16=False)
+
+    val_file = tmp_path / "val.txt"
+    val_file.write_text("hello world test sentence.\n", encoding="utf-8")
+    for bad_eval_argv in (
+        ["crouton-eval", "--checkpoint", str(ckpt_ok), "--val-file", ""],
+        ["crouton-eval", "--checkpoint", str(ckpt_ok), "--val-file", str(val_file), "--compare-checkpoint", ""],
+    ):
+        monkeypatch.setattr(sys, "argv", bad_eval_argv)
+        with pytest.raises(SystemExit):
+            eval_mod.main()
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            eval_mod,
+            "evaluate_bpb",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should validate compare checkpoint before primary eval")),
+        )
+        mp.setattr(
+            sys,
+            "argv",
+            [
+                "crouton-eval",
+                "--checkpoint",
+                str(ckpt_ok),
+                "--compare-checkpoint",
+                str(ckpt_bad),
+                "--tokenizer",
+                str(tok_path),
+                "--val-file",
+                str(val_file),
+                "--no-bf16",
+            ],
+        )
+        with pytest.raises(ValueError, match="vocab"):
+            eval_mod.main()

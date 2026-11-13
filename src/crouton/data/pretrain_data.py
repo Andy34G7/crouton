@@ -121,13 +121,17 @@ class StreamingPackedDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         buf: list[int] = []
+        pos = 0
         chunk_size = self.seq_len + 1
         for text in self._iter_texts():
             ids = self.tokenizer.encode(text, split_special_tokens=True)
             buf.extend(ids)
             buf.append(self.eos_id)
-            while len(buf) >= chunk_size:
-                chunk = buf[:chunk_size]
-                buf = buf[chunk_size:]
+            while len(buf) - pos >= chunk_size:
+                chunk = buf[pos : pos + chunk_size]
+                pos += chunk_size
                 t = torch.tensor(chunk, dtype=torch.long)
                 yield t[:-1], t[1:]
+            if pos >= max(chunk_size, len(buf) // 2):
+                buf = buf[pos:]
+                pos = 0

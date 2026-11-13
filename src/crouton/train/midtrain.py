@@ -19,6 +19,7 @@ from crouton.train.common import (
     instantiate_checkpoint_model,
     load_checkpoint_payload,
     next_or_restart,
+    normalize_optional_subset,
     save_checkpoint,
     validate_tokenizer_vocab,
 )
@@ -126,8 +127,8 @@ def run_midtrain(
     model = instantiate_checkpoint_model(ckpt, model_cfg, device)
 
     sources = (
-        [(dataset_name, subset, split, text_field)]
-        if dataset_name
+        [(dataset_name.strip(), subset, split.strip(), text_field.strip())]
+        if dataset_name is not None
         else [
             ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
             ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
@@ -205,10 +206,13 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    if args.local_file is not None and (
-        args.dataset is not None or args.subset is not None or args.split != "train" or args.text_field != "text"
-    ):
-        parser.error("--local-file cannot be combined with --dataset, --subset, --split, or --text-field")
+    if not args.base_checkpoint.strip() or not args.tokenizer.strip():
+        parser.error("--base-checkpoint and --tokenizer must be non-empty")
+    if args.local_file is not None:
+        if not args.local_file.strip():
+            parser.error("--local-file must be a non-empty file path")
+        if args.dataset is not None or args.subset is not None or args.split != "train" or args.text_field != "text":
+            parser.error("--local-file cannot be combined with --dataset, --subset, --split, or --text-field")
     try:
         _validate_midtrain_args(
             seq_len=args.seq_len,
@@ -230,7 +234,7 @@ def main() -> None:
         parser.error(str(exc))
 
     dataset_name = args.dataset.strip() if args.dataset is not None else None
-    subset = None if args.subset in (None, "none", "None", "") else args.subset
+    subset = normalize_optional_subset(args.subset)
     run_midtrain(
         base_checkpoint=args.base_checkpoint,
         tokenizer_path=args.tokenizer,
@@ -246,9 +250,9 @@ def main() -> None:
         adamw_lr=args.adamw_lr,
         dataset_name=dataset_name,
         subset=subset,
-        split=args.split,
-        text_field=args.text_field,
-        local_file=args.local_file,
+        split=args.split.strip(),
+        text_field=args.text_field.strip(),
+        local_file=args.local_file.strip() if args.local_file is not None else None,
         bf16=not args.no_bf16,
         save_interval=args.save_interval,
         seed=args.seed,

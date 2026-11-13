@@ -22,6 +22,7 @@ from crouton.train.common import (
     instantiate_checkpoint_model,
     load_checkpoint_payload,
     next_or_restart,
+    normalize_optional_subset,
     save_checkpoint,
     validate_tokenizer_vocab,
 )
@@ -92,6 +93,8 @@ def run_sft(
     validate_tokenizer_vocab(tokenizer, model_cfg)
 
     if examples_override is not None:
+        if not all(is_chatml_messages(ex) for ex in examples_override):
+            raise ValueError("All examples_override items must be non-empty ChatML {'role', 'content'} message lists.")
         examples = examples_override
     else:
         raw = load_dataset(dataset_name.strip(), subset, split="train", streaming=True)
@@ -107,12 +110,13 @@ def run_sft(
         raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
 
     model = instantiate_checkpoint_model(ckpt, model_cfg, device)
+    pad_mult = 128 if (device.type == "cuda" and model_cfg.use_flex_attention and torch.cuda.get_device_capability(device)[0] >= 8) else 1
     ds = SFTDataset(examples, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
     loader = DataLoader(
         ds,
         batch_size=micro_batch_size,
         shuffle=True,
-        collate_fn=partial(collate_sft_batch, pad_id=ds.pad_id),
+        collate_fn=partial(collate_sft_batch, pad_id=ds.pad_id, pad_to_multiple=pad_mult, max_seq_len=seq_len),
     )
     it = iter(loader)
 
@@ -178,17 +182,19 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    if not args.base_checkpoint.strip() or not args.tokenizer.strip():
+        parser.error("--base-checkpoint and --tokenizer must be non-empty")
+    norm_sub = normalize_optional_subset(args.subset)
     if args.preset is not None:
         if args.dataset is not None:
             parser.error("--preset cannot be combined with --dataset")
         dataset_name, preset_sub = SFT_PRESETS[args.preset]
-        subset = preset_sub if args.subset is None else (None if args.subset in ("none", "None", "") else args.subset)
+        subset = preset_sub if args.subset is None else norm_sub
     else:
         if args.dataset is not None and not args.dataset.strip():
             parser.error("--dataset must be a non-empty dataset name")
         dataset_name = args.dataset.strip() if args.dataset is not None else "HuggingFaceTB/smoltalk"
-        raw_sub = None if args.subset in (None, "none", "None", "") else args.subset
-        subset = "all" if (dataset_name == "HuggingFaceTB/smoltalk" and args.subset is None) else raw_sub
+        subset = "all" if (dataset_name == "HuggingFaceTB/smoltalk" and args.subset is None) else norm_sub
 
     try:
         _validate_sft_args(

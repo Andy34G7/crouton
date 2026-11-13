@@ -30,6 +30,14 @@ def safe_decode(tokenizer, token_ids: list[int]) -> str:
     return tokenizer.decode(filtered)
 
 
+def normalize_optional_subset(subset: str | None) -> str | None:
+    """Normalize optional HF subset names so blank or 'none' markers map cleanly to None."""
+    if subset is None:
+        return None
+    cleaned = subset.strip()
+    return None if cleaned in ("", "none", "None") else cleaned
+
+
 def validate_tokenizer_vocab(tokenizer, model_cfg: CroutonConfig) -> None:
     """Fail fast if the tokenizer produces IDs beyond the model embedding table."""
     if tokenizer.vocab_size > model_cfg.vocab_size:

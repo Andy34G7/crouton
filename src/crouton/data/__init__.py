@@ -7,6 +7,7 @@ from crouton.data.posttrain_data import (
     collate_sft_batch,
     format_chatml_sft_with_mask,
     is_chatml_messages,
+    is_valid_preference_pair,
 )
 from crouton.data.pretrain_data import StreamingPackedDataset, resolve_token_id
 
@@ -18,5 +19,6 @@ __all__ = [
     "collate_sft_batch",
     "format_chatml_sft_with_mask",
     "is_chatml_messages",
+    "is_valid_preference_pair",
     "resolve_token_id",
 ]

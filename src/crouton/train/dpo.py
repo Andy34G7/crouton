@@ -16,7 +16,7 @@ from tokenisers import WpBpePpigTokenizer
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from crouton.data import PreferenceDataset, collate_preference_batch
+from crouton.data import PreferenceDataset, collate_preference_batch, is_valid_preference_pair
 from crouton.optim import build_adamw_param_groups, set_optimizer_lr, wsd_lr_multiplier
 from crouton.train.common import (
     bf16_supported,
@@ -24,20 +24,24 @@ from crouton.train.common import (
     instantiate_checkpoint_model,
     load_checkpoint_payload,
     next_or_restart,
+    normalize_optional_subset,
     save_checkpoint,
     validate_tokenizer_vocab,
 )
 
 
 def sequence_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Sum log-probabilities over non-masked tokens (labels != -100)."""
-    token_nll = F.cross_entropy(
-        logits.float().reshape(-1, logits.size(-1)),
-        labels.reshape(-1),
-        ignore_index=-100,
-        reduction="none",
-    ).view_as(labels)
-    return -token_nll.sum(dim=-1)
+    """Sum log-probabilities over non-masked tokens (labels != -100) without full-sequence fp32 buffers."""
+    valid = labels != -100
+    flat_valid = valid.reshape(-1)
+    if not flat_valid.any():
+        return logits[..., 0].float().sum(dim=-1) * 0.0
+    sel_logits = logits.reshape(-1, logits.size(-1))[flat_valid].float()
+    sel_labels = labels.reshape(-1)[flat_valid]
+    sel_logps = -F.cross_entropy(sel_logits, sel_labels, reduction="none")
+    out = torch.zeros_like(flat_valid, dtype=torch.float32)
+    out[flat_valid] = sel_logps
+    return out.view_as(labels).sum(dim=-1)
 
 
 def _log1mexp(x: torch.Tensor) -> torch.Tensor:
@@ -143,12 +147,14 @@ def run_preference_tuning(
     validate_tokenizer_vocab(tokenizer, model_cfg)
 
     if pairs_override is not None:
+        if not all(is_valid_preference_pair(p) for p in pairs_override):
+            raise ValueError("Invalid preference pair in pairs_override: expected prompt, chosen, and rejected fields")
         pairs = pairs_override
     else:
         raw = load_dataset(dataset_name.strip(), subset, split="train", streaming=True)
         pairs = []
         for row in raw:
-            if "prompt" in row and "chosen" in row and "rejected" in row:
+            if is_valid_preference_pair(row):
                 pairs.append(
                     {
                         "prompt": row["prompt"],
@@ -170,12 +176,13 @@ def run_preference_tuning(
         for p in ref_model.parameters():
             p.requires_grad = False
 
+    pad_mult = 128 if (device.type == "cuda" and model_cfg.use_flex_attention and torch.cuda.get_device_capability(device)[0] >= 8) else 1
     ds = PreferenceDataset(pairs, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
     loader = DataLoader(
         ds,
         batch_size=micro_batch_size,
         shuffle=True,
-        collate_fn=partial(collate_preference_batch, pad_id=ds.pad_id),
+        collate_fn=partial(collate_preference_batch, pad_id=ds.pad_id, pad_to_multiple=pad_mult, max_seq_len=seq_len),
     )
     it = iter(loader)
 
@@ -210,11 +217,18 @@ def run_preference_tuning(
                 r_ids, r_lbl, r_mask = r_ids[valid_pair], r_lbl[valid_pair], r_mask[valid_pair]
             n_pairs = int(c_ids.size(0))
 
+            if not use_orpo:
+                with torch.no_grad(), amp_ctx:
+                    ref_c = sequence_logps(ref_model(c_ids, attention_mask=c_mask).logits, c_lbl)
+                    ref_r = sequence_logps(ref_model(r_ids, attention_mask=r_mask).logits, r_lbl)
+
             with amp_ctx:
                 c_out = policy(c_ids, attention_mask=c_mask)
-                r_out = policy(r_ids, attention_mask=r_mask)
                 p_c = sequence_logps(c_out.logits, c_lbl)
+                del c_out
+                r_out = policy(r_ids, attention_mask=r_mask)
                 p_r = sequence_logps(r_out.logits, r_lbl)
+                del r_out
 
                 if use_orpo:
                     c_len = (c_lbl != -100).sum(dim=-1)
@@ -222,9 +236,6 @@ def run_preference_tuning(
                     chosen_sft_loss = (-p_c / c_len.clamp(min=1)).mean()
                     loss = orpo_loss(p_c, p_r, chosen_sft_loss, c_len, r_len, beta=beta)
                 else:
-                    with torch.no_grad():
-                        ref_c = sequence_logps(ref_model(c_ids, attention_mask=c_mask).logits, c_lbl)
-                        ref_r = sequence_logps(ref_model(r_ids, attention_mask=r_mask).logits, r_lbl)
                     loss = dpo_loss(p_c, p_r, ref_c, ref_r, beta=beta)
 
                 weighted_loss = loss * float(n_pairs)
@@ -271,6 +282,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    if not args.base_checkpoint.strip() or not args.tokenizer.strip():
+        parser.error("--base-checkpoint and --tokenizer must be non-empty")
     try:
         _validate_dpo_args(
             seq_len=args.seq_len,
@@ -286,7 +299,7 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    subset = None if args.subset in (None, "none", "None", "") else args.subset
+    subset = normalize_optional_subset(args.subset)
     run_preference_tuning(
         base_checkpoint=args.base_checkpoint,
         tokenizer_path=args.tokenizer,

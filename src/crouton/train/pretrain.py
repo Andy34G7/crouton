@@ -161,14 +161,26 @@ def main() -> None:
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
 
+    model_config_path = args.model_config.strip()
+    output_dir = args.output_dir.strip()
+    tokenizer_path = args.tokenizer.strip()
+    if not model_config_path or not output_dir or not tokenizer_path:
+        parser.error("--model-config, --output-dir, and --tokenizer must be non-empty")
+    local_file = args.local_file.strip() if args.local_file is not None else None
+    if local_file is not None and not local_file:
+        parser.error("--local-file must be a non-empty file path")
+    val_file = args.val_file.strip() if args.val_file is not None else None
+    if val_file is not None and not val_file:
+        parser.error("--val-file must be a non-empty file path")
+
     if args.vocab_size is not None and args.vocab_size < 1:
         parser.error("--vocab-size must be >= 1")
     if args.seq_len is not None and args.seq_len < 1:
         parser.error("--seq-len must be >= 1")
     try:
         train_cfg = TrainConfig(
-            output_dir=args.output_dir,
-            tokenizer_path=args.tokenizer,
+            output_dir=output_dir,
+            tokenizer_path=tokenizer_path,
             seq_len=args.seq_len if args.seq_len is not None else 1,
             micro_batch_size=args.micro_batch,
             grad_accum_steps=args.grad_accum,
@@ -186,11 +198,11 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    for label, fpath in (("Local training", args.local_file), ("Validation", args.val_file)):
+    for label, fpath in (("Local training", local_file), ("Validation", val_file)):
         if fpath is not None and not [line for line in Path(fpath).read_text(encoding="utf-8").splitlines() if line.strip()]:
             raise ValueError(f"{label} file {fpath!r} contains no non-empty lines")
 
-    model_cfg = CroutonConfig.from_yaml(args.model_config)
+    model_cfg = CroutonConfig.from_yaml(model_config_path)
     if args.vocab_size is not None:
         model_cfg.vocab_size = args.vocab_size
     if args.seq_len is not None:
@@ -199,7 +211,7 @@ def main() -> None:
     model_cfg.__post_init__()
     if args.seq_len is None:
         train_cfg.seq_len = model_cfg.max_seq_len
-    run_pretrain(model_cfg, train_cfg, local_file=args.local_file, val_file=args.val_file)
+    run_pretrain(model_cfg, train_cfg, local_file=local_file, val_file=val_file)
 
 
 if __name__ == "__main__":

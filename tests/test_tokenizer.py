@@ -175,3 +175,120 @@ def test_train_wp_bpe_ppig_json_and_dir_and_sft_masking(tmp_path):
     )
     pref_batch = collate_preference_batch([pref_var[0], pref_var[1]], pad_id=pref_var.pad_id)
     assert pref_batch["chosen_ids"].shape[1] < 128 and pref_batch["rejected_ids"].shape[1] < 128
+
+
+def test_posttrain_validation_padding_and_streaming_cursor(tmp_path):
+    import pytest
+    import torch
+    from crouton.data import (
+        PreferenceDataset,
+        SFTDataset,
+        StreamingPackedDataset,
+        collate_sft_batch,
+        format_chatml_sft_with_mask,
+        is_valid_preference_pair,
+    )
+
+    corpus = ["Dense MoE transformer training text. " * 20]
+    tok = train_crouton_tokenizer(corpus, output_path=tmp_path / "tok.json", vocab_size=260)
+    msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+
+    with pytest.raises(ValueError, match="seq_len must be >= 1"):
+        format_chatml_sft_with_mask(msgs, tok, seq_len=0)
+    with pytest.raises(ValueError, match="seq_len must be >= 1"):
+        SFTDataset([msgs], tok, seq_len=0)
+    with pytest.raises(ValueError, match="seq_len must be >= 1"):
+        PreferenceDataset([{"prompt": "hi", "chosen": "ok", "rejected": "no"}], tok, seq_len=0)
+
+    bad_pairs = [
+        {"prompt": ["bad"], "chosen": "ok", "rejected": "no"},
+        {"prompt": "hi", "chosen": [{"text": "ok"}], "rejected": "no"},
+        {"prompt": "hi", "chosen": "ok", "rejected": [{"role": 123, "content": "no"}]},
+    ]
+    for bad in bad_pairs:
+        assert not is_valid_preference_pair(bad)
+        with pytest.raises(ValueError, match="non-empty"):
+            _ = PreferenceDataset([bad], tok, seq_len=32)[0]
+
+    assert is_valid_preference_pair({"prompt": "hi", "chosen": "ok", "rejected": "no"})
+    assert is_valid_preference_pair({"prompt": [{"role": "user", "content": "hi"}], "chosen": [{"role": "assistant", "content": "ok"}], "rejected": "no"})
+
+    # pad_to_multiple aligns dynamic batch length up to a block multiple bounded by max_seq_len
+    sft_var = SFTDataset(
+        [
+            msgs,
+            [{"role": "user", "content": "hello world " * 4}, {"role": "assistant", "content": "sure thing"}],
+        ],
+        tokenizer=tok,
+        seq_len=32,
+        pad_to_max=False,
+    )
+    pad_id = resolve_token_id(tok, "<|endoftext|>", fallback=0)
+    x_aln, y_aln, m_aln = collate_sft_batch([sft_var[0], sft_var[1]], pad_id=pad_id, pad_to_multiple=8, max_seq_len=32)
+    assert x_aln.shape == y_aln.shape == m_aln.shape
+    assert x_aln.shape[1] % 8 == 0 and x_aln.shape[1] <= 32
+    raw_max = max(sft_var[0][0].numel(), sft_var[1][0].numel())
+    assert x_aln.shape[1] >= raw_max
+    if x_aln.shape[1] > sft_var[0][0].numel():
+        pad_slice = slice(sft_var[0][0].numel(), x_aln.shape[1])
+        assert torch.all(x_aln[0, pad_slice] == pad_id)
+        assert torch.all(y_aln[0, pad_slice] == -100)
+        assert torch.all(~m_aln[0, pad_slice])
+
+    # StreamingPackedDataset cursor compaction preserves exact shifted sequences
+    import itertools
+
+    docs = ["alpha beta gamma delta epsilon " * 3 for _ in range(30)]
+    chunks = list(itertools.islice(StreamingPackedDataset(tokenizer=tok, seq_len=8, local_texts=docs), 25))
+    assert len(chunks) == 25
+    for cx, cy in chunks:
+        assert cx.shape == (8,) and cy.shape == (8,)
+        assert torch.equal(cx[1:], cy[:-1])
+
+
+def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
+    import sys
+    import pytest
+    from crouton.tokenizer import train_tokenizer as tok_cli
+
+    text_file = tmp_path / "train.txt"
+    text_file.write_text("Dense MoE transformer training text. " * 20, encoding="utf-8")
+    out_tok = tmp_path / "cli_tok.json"
+
+    for bad_argv in (
+        ["crouton-train-tokenizer", "--local-file", ""],
+        ["crouton-train-tokenizer", "--local-file", "   "],
+        ["crouton-train-tokenizer", "--local-file", str(text_file), "--split", "val"],
+        ["crouton-train-tokenizer", "--local-file", str(text_file), "--text-field", "body"],
+        ["crouton-train-tokenizer", "--local-file", str(text_file), "--subset", "   "],
+    ):
+        monkeypatch.setattr(sys, "argv", bad_argv)
+        with pytest.raises(SystemExit):
+            tok_cli.main()
+
+    seen: dict[str, object] = {}
+
+    def _fake_stream(sources, max_docs):
+        seen["sources"] = sources
+        seen["max_docs"] = max_docs
+        return ["Dense MoE transformer training text. " * 20]
+
+    monkeypatch.setattr(tok_cli, "iter_hf_corpus", _fake_stream)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "crouton-train-tokenizer",
+            "--dataset",
+            "custom/ds",
+            "--subset",
+            "   ",
+            "--vocab-size",
+            "260",
+            "--output",
+            str(out_tok),
+        ],
+    )
+    tok_cli.main()
+    assert seen["sources"] == [("custom/ds", None, "train", "text")]
+    assert out_tok.exists()

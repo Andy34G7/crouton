@@ -125,17 +125,26 @@ def main() -> None:
         parser.error("--dataset must be a non-empty dataset name")
     if not args.split.strip() or not args.text_field.strip():
         parser.error("--split and --text-field must be non-empty")
-    if args.local_file and (args.dataset is not None or args.subset is not None):
-        parser.error("--local-file cannot be combined with --dataset or --subset")
+    if args.local_file is not None:
+        if not args.local_file.strip():
+            parser.error("--local-file must be a non-empty file path")
+        if (
+            args.dataset is not None
+            or args.subset is not None
+            or args.split != "train"
+            or args.text_field != "text"
+        ):
+            parser.error("--local-file cannot be combined with --dataset, --subset, --split, or --text-field")
     if args.subset is not None and args.dataset is None:
         parser.error("--subset requires --dataset")
 
-    if args.local_file:
-        corpus = read_local_corpus(args.local_file)
+    if args.local_file is not None:
+        corpus = read_local_corpus(args.local_file.strip())
         if not corpus or not any(line.strip() for line in corpus):
             raise ValueError(f"Local tokenizer corpus {args.local_file!r} contains no non-empty text")
     elif args.dataset is not None:
-        subset = None if args.subset in (None, "none", "None", "") else args.subset
+        raw_sub = args.subset.strip() if args.subset is not None else None
+        subset = None if raw_sub in (None, "", "none", "None") else raw_sub
         corpus = iter_hf_corpus(
             sources=[(args.dataset.strip(), subset, args.split.strip(), args.text_field.strip())],
             max_docs=args.max_docs,

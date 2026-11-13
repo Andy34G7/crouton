@@ -343,6 +343,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    base_checkpoint = args.base_checkpoint.strip()
+    tokenizer_path = args.tokenizer.strip()
+    output_dir = args.output_dir.strip()
+    if not base_checkpoint or not tokenizer_path or not output_dir:
+        parser.error("--base-checkpoint, --tokenizer, and --output-dir must be non-empty")
+
     try:
         _validate_grpo_args(
             group_size=args.group_size,
@@ -358,10 +364,10 @@ def main() -> None:
         parser.error(str(exc))
 
     # Validate checkpoint config, max_new_tokens bound, and tokenizer before HF GSM8K streaming.
-    _, cfg, _ = load_checkpoint_payload(args.base_checkpoint)
+    _, cfg, _ = load_checkpoint_payload(base_checkpoint)
     if args.max_new_tokens >= cfg.max_seq_len:
         raise ValueError(f"max_new_tokens ({args.max_new_tokens}) must be < model max_seq_len ({cfg.max_seq_len})")
-    validate_tokenizer_vocab(WpBpePpigTokenizer.from_pretrained(args.tokenizer), cfg)
+    validate_tokenizer_vocab(WpBpePpigTokenizer.from_pretrained(tokenizer_path), cfg)
 
     tasks = (
         build_builtin_math_tasks(n=max(args.steps, 64), seed=args.seed)
@@ -369,9 +375,9 @@ def main() -> None:
         else load_gsm8k_tasks(max_examples=args.max_examples)
     )
     run_grpo(
-        base_checkpoint=args.base_checkpoint,
-        tokenizer_path=args.tokenizer,
-        output_dir=args.output_dir,
+        base_checkpoint=base_checkpoint,
+        tokenizer_path=tokenizer_path,
+        output_dir=output_dir,
         prompts_with_verifiers=tasks,
         group_size=args.group_size,
         steps=args.steps,

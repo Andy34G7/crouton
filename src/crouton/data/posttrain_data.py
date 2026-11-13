@@ -15,8 +15,29 @@ def is_chatml_messages(messages: Any) -> bool:
     return (
         isinstance(messages, list)
         and bool(messages)
-        and all(isinstance(m, dict) and "role" in m and "content" in m for m in messages)
+        and all(
+            isinstance(m, dict)
+            and isinstance(m.get("role"), str)
+            and bool(m["role"].strip())
+            and "content" in m
+            and (m["content"] is None or isinstance(m["content"], str))
+            for m in messages
+        )
     )
+
+
+def is_valid_preference_pair(item: Any) -> bool:
+    """Return True when a preference record has valid prompt, chosen, and rejected fields."""
+    if not isinstance(item, dict) or not {"prompt", "chosen", "rejected"} <= item.keys():
+        return False
+    for field in ("prompt", "chosen", "rejected"):
+        val = item[field]
+        if isinstance(val, list):
+            if not is_chatml_messages(val):
+                return False
+        elif val is not None and not isinstance(val, str):
+            return False
+    return True
 
 
 def _encode_chatml_messages(
@@ -110,6 +131,8 @@ def format_chatml_sft_with_mask(
     (left-truncating long prompts) so targets never collapse to all -100 when avoidable.
     Returns (input_ids, targets, attention_mask) each of shape [seq_len] when pad_to_max=True.
     """
+    if seq_len < 1:
+        raise ValueError("seq_len must be >= 1")
     pad_id = resolve_token_id(tokenizer, "<|pad|>", fallback=resolve_token_id(tokenizer, "<|endoftext|>", fallback=0))
     input_ids, targets = _encode_chatml_messages(messages, tokenizer, mask_earlier_assistant_turns)
     input_ids, targets = _truncate_keep_supervision(input_ids, targets, seq_len + 1)
@@ -119,22 +142,28 @@ def format_chatml_sft_with_mask(
 def collate_sft_batch(
     batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     pad_id: int = 0,
+    pad_to_multiple: int = 1,
+    max_seq_len: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Right-pad a batch of SFT samples to the longest sequence in the batch."""
+    """Right-pad SFT samples to batch max (optionally block-aligned for FlexAttention)."""
     if not batch:
         raise ValueError("Cannot collate empty SFT batch")
-    first_len = int(batch[0][0].size(0))
-    if all(int(x.size(0)) == first_len for x, _, _ in batch):
+    max_len = max(1, *(int(x.size(0)) for x, _, _ in batch))
+    target_len = max_len
+    if pad_to_multiple > 1 and max_len >= pad_to_multiple:
+        target_len = ((max_len + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
+        if max_seq_len is not None:
+            target_len = min(max_seq_len, target_len)
+    if all(int(x.size(0)) == target_len for x, _, _ in batch):
         return (
             torch.stack([x for x, _, _ in batch], dim=0),
             torch.stack([y for _, y, _ in batch], dim=0),
             torch.stack([m for _, _, m in batch], dim=0),
         )
-    max_len = max(1, *(int(x.size(0)) for x, _, _ in batch))
     bsz = len(batch)
-    x_out = torch.full((bsz, max_len), pad_id, dtype=torch.long)
-    y_out = torch.full((bsz, max_len), -100, dtype=torch.long)
-    m_out = torch.zeros((bsz, max_len), dtype=torch.bool)
+    x_out = torch.full((bsz, target_len), pad_id, dtype=torch.long)
+    y_out = torch.full((bsz, target_len), -100, dtype=torch.long)
+    m_out = torch.zeros((bsz, target_len), dtype=torch.bool)
     for i, (x, y, m) in enumerate(batch):
         n = int(x.size(0))
         if n > 0:
@@ -147,6 +176,8 @@ def collate_sft_batch(
 def collate_preference_batch(
     batch: list[dict[str, torch.Tensor]],
     pad_id: int = 0,
+    pad_to_multiple: int = 1,
+    max_seq_len: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Right-pad chosen and rejected pairs independently to batch-max lengths."""
     if not batch:
@@ -154,10 +185,14 @@ def collate_preference_batch(
     c_x, c_y, c_m = collate_sft_batch(
         [(b["chosen_ids"], b["chosen_labels"], b["chosen_mask"]) for b in batch],
         pad_id=pad_id,
+        pad_to_multiple=pad_to_multiple,
+        max_seq_len=max_seq_len,
     )
     r_x, r_y, r_m = collate_sft_batch(
         [(b["rejected_ids"], b["rejected_labels"], b["rejected_mask"]) for b in batch],
         pad_id=pad_id,
+        pad_to_multiple=pad_to_multiple,
+        max_seq_len=max_seq_len,
     )
     return {
         "chosen_ids": c_x,
@@ -179,6 +214,8 @@ class SFTDataset(Dataset):
         seq_len: int,
         pad_to_max: bool = True,
     ) -> None:
+        if seq_len < 1:
+            raise ValueError("seq_len must be >= 1")
         self.examples = examples
         self.tokenizer = tokenizer
         self.seq_len = seq_len
@@ -209,6 +246,8 @@ class PreferenceDataset(Dataset):
         seq_len: int,
         pad_to_max: bool = True,
     ) -> None:
+        if seq_len < 1:
+            raise ValueError("seq_len must be >= 1")
         self.pairs = pairs
         self.tokenizer = tokenizer
         self.seq_len = seq_len
@@ -222,15 +261,20 @@ class PreferenceDataset(Dataset):
 
     @staticmethod
     def _to_messages(prompt: str | list[dict[str, str]], response: str | list[dict[str, str]]) -> list[dict[str, str]]:
+        if prompt is not None and not isinstance(prompt, (str, list)):
+            raise ValueError("Preference prompt must be a string, None, or non-empty ChatML message list")
+        if response is not None and not isinstance(response, (str, list)):
+            raise ValueError("Preference response must be a string, None, or non-empty ChatML message list")
+        if isinstance(prompt, list) and not is_chatml_messages(prompt):
+            raise ValueError("Preference prompt message list must be a non-empty list of {'role', 'content'} dicts")
         if isinstance(response, list):
-            if not response:
-                raise ValueError("Preference response message list must be non-empty")
-            if is_chatml_messages(response):
-                if is_chatml_messages(prompt) and response[: len(prompt)] != prompt:
-                    return [*prompt, *response]
-                if isinstance(prompt, str) and prompt and response[0].get("role") == "assistant":
-                    return [{"role": "user", "content": prompt}, *response]
-                return response
+            if not is_chatml_messages(response):
+                raise ValueError("Preference response message list must be a non-empty list of {'role', 'content'} dicts")
+            if is_chatml_messages(prompt) and response[: len(prompt)] != prompt:
+                return [*prompt, *response]
+            if isinstance(prompt, str) and prompt and response[0].get("role") == "assistant":
+                return [{"role": "user", "content": prompt}, *response]
+            return response
         if is_chatml_messages(prompt):
             return [*prompt, {"role": "assistant", "content": "" if response is None else str(response)}]
         return [

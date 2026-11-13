@@ -17,7 +17,8 @@ from crouton.train.common import (
     bf16_supported,
     evaluate_model_bpb,
     get_device,
-    load_checkpoint,
+    instantiate_checkpoint_model,
+    load_checkpoint_payload,
     safe_decode,
     validate_tokenizer_vocab,
 )
@@ -69,15 +70,16 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
     ) -> None:
         if batch_size < 1 or max_gen_toks < 1:
             raise ValueError("batch_size and max_gen_toks must be >= 1")
+        ckpt, self.model_cfg, _ = load_checkpoint_payload(checkpoint_path)
+        raw_tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+        validate_tokenizer_vocab(raw_tokenizer, self.model_cfg)
         resolved_device = torch.device(device) if device else get_device()
         if HAS_LM_EVAL:
             super().__init__()
         self._device = resolved_device
         self._bf16 = bf16
-        self.model, self.model_cfg, _ = load_checkpoint(checkpoint_path, device=self._device)
+        self.model = instantiate_checkpoint_model(ckpt, self.model_cfg, self._device)
         self.model.eval()
-        raw_tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
-        validate_tokenizer_vocab(raw_tokenizer, self.model_cfg)
         self._eot_id = resolve_token_id(raw_tokenizer, "<|endoftext|>", fallback=0)
         self._im_end_id = resolve_token_id(raw_tokenizer, "<|im_end|>", fallback=self._eot_id)
         self.tokenizer = _TokenizerCompat(raw_tokenizer, tokenizer_path=tokenizer_path, eot_id=self._eot_id)
@@ -343,13 +345,19 @@ def evaluate_bpb(
     for fair comparison across tokenizers (e.g., crouton vs shortcake).
     Prepends EOS so every token in each document is scored.
     """
-    device = get_device()
-    model, model_cfg, _ = load_checkpoint(checkpoint_path, device=device)
+    if seq_len is not None and seq_len < 1:
+        raise ValueError("seq_len must be >= 1")
+    if not texts or not all(isinstance(t, str) for t in texts) or not any(t.strip() for t in texts):
+        raise ValueError("Evaluation texts must contain at least one non-empty string")
+    ckpt, model_cfg, _ = load_checkpoint_payload(checkpoint_path)
     eff_seq_len = seq_len if seq_len is not None else model_cfg.max_seq_len
     if eff_seq_len < 1:
         raise ValueError("seq_len must be >= 1")
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
+    device = get_device()
+    model = instantiate_checkpoint_model(ckpt, model_cfg, device)
+    model.eval()
     use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
     return evaluate_model_bpb(model, tokenizer, texts, eff_seq_len, device, amp_ctx)
@@ -388,7 +396,24 @@ def main() -> None:
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
 
-    if not args.val_file and not args.tasks:
+    checkpoint_path = args.checkpoint.strip()
+    tokenizer_path = args.tokenizer.strip()
+    if not checkpoint_path or not tokenizer_path:
+        parser.error("--checkpoint and --tokenizer must be non-empty")
+
+    compare_checkpoint = args.compare_checkpoint.strip() if args.compare_checkpoint is not None else None
+    if compare_checkpoint is not None and not compare_checkpoint:
+        parser.error("--compare-checkpoint must be a non-empty path")
+
+    val_file = args.val_file.strip() if args.val_file is not None else None
+    if val_file is not None and not val_file:
+        parser.error("--val-file must be a non-empty path")
+
+    output_json = args.output_json.strip() if args.output_json is not None else None
+    if output_json is not None and not output_json:
+        parser.error("--output-json must be a non-empty path")
+
+    if val_file is None and args.tasks is None:
         parser.error("Provide at least one of --val-file or --tasks")
     if args.batch_size < 1 or (args.limit is not None and args.limit < 1) or (args.seq_len is not None and args.seq_len < 1):
         parser.error("--batch-size, --limit, and --seq-len must all be >= 1")
@@ -402,35 +427,45 @@ def main() -> None:
             raise RuntimeError("lm-eval is not installed. Install with: uv sync --extra dev --extra eval")
 
     texts: list[str] | None = None
-    if args.val_file:
-        texts = [line.strip() for line in Path(args.val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+    if val_file is not None:
+        texts = [line.strip() for line in Path(val_file).read_text(encoding="utf-8").splitlines() if line.strip()]
         if not texts:
-            raise ValueError(f"Validation file {args.val_file!r} contains no non-empty lines")
+            raise ValueError(f"Validation file {val_file!r} contains no non-empty lines")
+
+    # Pre-validate tokenizer and both checkpoints before running potentially long evaluations.
+    tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
+    for ckpt_label, ckpt_path in (("primary", checkpoint_path), ("compare", compare_checkpoint)):
+        if ckpt_path is None:
+            continue
+        _, ckpt_cfg, _ = load_checkpoint_payload(ckpt_path)
+        validate_tokenizer_vocab(tokenizer, ckpt_cfg)
+        if texts is not None and args.seq_len is None and ckpt_cfg.max_seq_len < 1:
+            raise ValueError(f"{ckpt_label} checkpoint max_seq_len must be >= 1")
 
     use_bf16 = not args.no_bf16
     report: dict[str, Any] = {"primary": {}}
     if texts is not None:
         report["primary"]["bpb"] = evaluate_bpb(
-            args.checkpoint, args.tokenizer, texts, seq_len=args.seq_len, bf16=use_bf16
+            checkpoint_path, tokenizer_path, texts, seq_len=args.seq_len, bf16=use_bf16
         )
-        if args.compare_checkpoint:
+        if compare_checkpoint is not None:
             report.setdefault("compare", {})["bpb"] = evaluate_bpb(
-                args.compare_checkpoint, args.tokenizer, texts, seq_len=args.seq_len, bf16=use_bf16
+                compare_checkpoint, tokenizer_path, texts, seq_len=args.seq_len, bf16=use_bf16
             )
 
     if task_list:
         report["primary"]["lm_eval"] = evaluate_lm_eval(
-            args.checkpoint, args.tokenizer, task_list, limit=args.limit, batch_size=args.batch_size, bf16=use_bf16
+            checkpoint_path, tokenizer_path, task_list, limit=args.limit, batch_size=args.batch_size, bf16=use_bf16
         )
-        if args.compare_checkpoint:
+        if compare_checkpoint is not None:
             report.setdefault("compare", {})["lm_eval"] = evaluate_lm_eval(
-                args.compare_checkpoint, args.tokenizer, task_list, limit=args.limit, batch_size=args.batch_size, bf16=use_bf16
+                compare_checkpoint, tokenizer_path, task_list, limit=args.limit, batch_size=args.batch_size, bf16=use_bf16
             )
 
     print(json.dumps(report, indent=2))
-    if args.output_json:
-        Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output_json).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    if output_json is not None:
+        Path(output_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_json).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
