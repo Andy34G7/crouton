@@ -270,6 +270,9 @@ def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="output_path"):
         train_crouton_tokenizer(["hello world"], output_path="   ", vocab_size=260)
 
+    with pytest.raises(ValueError, match="sources must be non-empty"):
+        tok_cli.iter_hf_corpus([], 1)
+
     seen: dict[str, object] = {}
 
     def _fake_stream(sources, max_docs):
@@ -321,6 +324,7 @@ def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
         str(conflict_file),
         str(conflict_file / "tok.json"),
         f"{tmp_path / 'dir_slash.json'}/",
+        f"{tmp_path / 'dir_dot.json'}/.",
     ):
         monkeypatch.setattr(sys, "argv", ["crouton-train-tokenizer", "--output", bad_out])
         with pytest.raises(SystemExit):

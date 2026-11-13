@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 from pathlib import Path
 
 from tokenisers import WpBpePpigTokenizer
 
 from crouton.tokenizer.pretokenizer import DEFAULT_SPECIAL_TOKENS, build_crouton_pretokenizer
+from crouton.train.common import looks_like_dir_path, normalize_optional_subset, validate_sequence_arg
 
 
 DEFAULT_TOKENIZER_SOURCES = [
@@ -23,6 +23,9 @@ def iter_hf_corpus(
     sources: list[tuple[str, str | None, str, str]],
     max_docs: int,
 ) -> list[str]:
+    validate_sequence_arg(sources, "sources")
+    if not sources:
+        raise ValueError("sources must be non-empty")
     if max_docs < 1:
         raise ValueError(f"max_docs ({max_docs}) must be >= 1")
     from datasets import load_dataset
@@ -58,15 +61,14 @@ def _validate_tokenizer_output_path(output_path: str | Path) -> Path:
     out_str = str(output_path).strip() if isinstance(output_path, (str, Path)) else ""
     if not out_str:
         raise ValueError("output_path must be non-empty")
-    has_trailing_sep = isinstance(output_path, str) and (
-        out_str.endswith(os.sep) or (os.altsep is not None and out_str.endswith(os.altsep))
-    )
     out = Path(out_str)
     for parent in out.parents:
         if (parent.exists() and not parent.is_dir()) or (parent.is_symlink() and not parent.exists()):
             raise ValueError(f"Tokenizer output parent path {str(parent)!r} exists and is not a directory")
     if out.suffix == ".json":
-        if has_trailing_sep or out.is_dir() or (out.is_symlink() and not out.exists()):
+        if (isinstance(output_path, str) and looks_like_dir_path(out_str)) or out.is_dir() or (
+            out.is_symlink() and not out.exists()
+        ):
             raise ValueError(f"Tokenizer JSON output path {out_str!r} must be a file path, not a directory")
     elif (out.exists() and not out.is_dir()) or (out.is_symlink() and not out.exists()):
         raise ValueError(f"Tokenizer output directory {out_str!r} exists and is not a directory")
@@ -170,8 +172,7 @@ def main() -> None:
         if not corpus or not any(line.strip() for line in corpus):
             raise ValueError(f"Local tokenizer corpus {local_file!r} contains no non-empty text")
     elif args.dataset is not None:
-        raw_sub = args.subset.strip() if args.subset is not None else None
-        subset = None if raw_sub in (None, "", "none", "None") else raw_sub
+        subset = normalize_optional_subset(args.subset)
         corpus = iter_hf_corpus(
             sources=[(args.dataset.strip(), subset, split, text_field)],
             max_docs=args.max_docs,

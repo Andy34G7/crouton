@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -20,10 +19,12 @@ from crouton.train.common import (
     get_device,
     instantiate_checkpoint_model,
     load_checkpoint_payload,
+    looks_like_dir_path,
     read_nonempty_lines,
     safe_decode,
     strip_required_paths,
     validate_output_dir,
+    validate_sequence_arg,
     validate_tokenizer_vocab,
 )
 
@@ -54,7 +55,19 @@ class _TokenizerCompat:
         self.unk_token_id = None
 
     def encode(self, text: str, **kwargs) -> list[int]:
-        return list(self._tokenizer.encode(text))
+        encode_kwargs = {
+            key: kwargs[key]
+            for key in ("dropout", "seed", "split_special_tokens")
+            if key in kwargs
+        }
+        return list(self._tokenizer.encode(text, **encode_kwargs))
+
+    def decode(self, tokens: list[int], skip_special_tokens: bool = False, **kwargs) -> str:
+        toks = [int(t) for t in tokens]
+        if skip_special_tokens:
+            special_ids = set(self._tokenizer.special_tokens().values())
+            toks = [t for t in toks if t not in special_ids]
+        return safe_decode(self._tokenizer, toks)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._tokenizer, name)
@@ -123,10 +136,10 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
         return self._batch_size
 
     def tok_encode(self, string: str, **kwargs) -> list[int]:
-        return list(self.tokenizer.encode(string))
+        return self.tokenizer.encode(string, **kwargs)
 
-    def tok_decode(self, tokens: list[int], **kwargs) -> str:
-        return safe_decode(self.tokenizer, tokens)
+    def tok_decode(self, tokens: list[int], skip_special_tokens: bool = False, **kwargs) -> str:
+        return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens, **kwargs)
 
     def apply_chat_template(self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True) -> str:
         parts: list[str] = []
@@ -360,6 +373,7 @@ def evaluate_bpb(
     )
     if seq_len is not None and seq_len < 1:
         raise ValueError("seq_len must be >= 1")
+    validate_sequence_arg(texts, "Evaluation texts")
     if not texts or not all(isinstance(t, str) for t in texts) or not any(t.strip() for t in texts):
         raise ValueError("Evaluation texts must contain at least one non-empty string")
     ckpt, model_cfg, _ = load_checkpoint_payload(checkpoint_path)
@@ -386,6 +400,7 @@ def evaluate_lm_eval(
 ) -> dict[str, Any]:
     if batch_size < 1 or (limit is not None and limit < 1):
         raise ValueError("batch_size and limit must be >= 1")
+    validate_sequence_arg(tasks, "tasks")
     if not tasks or any(not isinstance(t, str) or not t.strip() for t in tasks):
         raise ValueError("tasks must contain at least one non-empty task name")
     clean_tasks = [t.strip() for t in tasks]
@@ -431,7 +446,7 @@ def main() -> None:
     if output_json is not None:
         if not output_json:
             parser.error("--output-json must be a non-empty path")
-        if output_json.endswith(os.sep) or (os.altsep is not None and output_json.endswith(os.altsep)):
+        if looks_like_dir_path(output_json):
             parser.error("--output-json must be a file path, not a directory")
         out_json_path = Path(output_json)
         if out_json_path.is_dir() or (out_json_path.is_symlink() and not out_json_path.exists()):

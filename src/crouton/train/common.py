@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import math
+import os
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -34,8 +35,27 @@ def normalize_optional_subset(subset: str | None) -> str | None:
     """Normalize optional HF subset names so blank or 'none' markers map cleanly to None."""
     if subset is None:
         return None
+    if not isinstance(subset, str):
+        raise ValueError("subset must be a string when specified")
     cleaned = subset.strip()
     return None if cleaned in ("", "none", "None") else cleaned
+
+
+def validate_sequence_arg(value: Any, name: str) -> None:
+    """Require a list or tuple sequence container (rejecting bare strings, bytes, and single-use iterators)."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a list or tuple")
+
+
+def looks_like_dir_path(raw_path: str) -> bool:
+    """Return True if a raw string uses '.', '..', or trailing directory separators that Path would normalize away."""
+    s = raw_path.strip()
+    if not s:
+        return False
+    if s in (".", ".."):
+        return True
+    seps = tuple(dict.fromkeys(sep for sep in (os.sep, os.altsep, "/") if sep))
+    return s.endswith(seps) or any(s.endswith(f"{sep}.") or s.endswith(f"{sep}..") for sep in seps)
 
 
 def strip_required_paths(**named_paths: str) -> tuple[str, ...]:
@@ -79,7 +99,9 @@ def read_nonempty_lines(path: str | Path, label: str = "Text file") -> list[str]
 
 
 def validate_tokenizer_vocab(tokenizer, model_cfg: CroutonConfig) -> None:
-    """Fail fast if the tokenizer produces IDs beyond the model embedding table."""
+    """Fail fast if tokenizer vocab is empty or produces IDs beyond the model embedding table."""
+    if tokenizer.vocab_size < 1:
+        raise ValueError(f"Tokenizer vocab_size ({tokenizer.vocab_size}) must be >= 1.")
     if tokenizer.vocab_size > model_cfg.vocab_size:
         raise ValueError(
             f"Tokenizer vocab_size ({tokenizer.vocab_size}) exceeds model vocab_size ({model_cfg.vocab_size})."
@@ -185,7 +207,7 @@ def evaluate_model_bpb(
             raise ValueError("Evaluation texts must contain at least one non-empty tokenizable document")
 
         avg_nats = total_nll_nats / total_tokens
-        ppl = math.exp(min(avg_nats, 20.0))
+        ppl = math.exp(min(avg_nats, 50.0))
         bpb = (total_nll_nats / math.log(2.0)) / total_bytes
         return {"loss_nats": avg_nats, "ppl": ppl, "bpb": bpb, "tokens": float(total_tokens)}
     finally:

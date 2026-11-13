@@ -27,6 +27,7 @@ from crouton.train.common import (
     save_checkpoint,
     strip_required_paths,
     validate_output_dir,
+    validate_sequence_arg,
     validate_tokenizer_vocab,
 )
 
@@ -97,6 +98,7 @@ def run_sft(
     else:
         resolved_subset = normalize_optional_subset(subset)
     if examples_override is not None:
+        validate_sequence_arg(examples_override, "examples_override")
         if not examples_override:
             raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
         if not all(is_chatml_messages(ex) for ex in examples_override):
@@ -107,10 +109,10 @@ def run_sft(
     use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    ckpt, model_cfg, _ = load_checkpoint_payload(
-        base_checkpoint,
-        override_seq_len=seq_len,
-    )
+    ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint)
+    if seq_len > model_cfg.max_seq_len:
+        model_cfg.max_seq_len = seq_len
+        model_cfg.__post_init__()
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
 

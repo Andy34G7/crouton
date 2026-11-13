@@ -67,8 +67,11 @@ class CroutonConfig:
             or self.logit_softcap < 0.0
             or not math.isfinite(self.router_jitter)
             or self.router_jitter < 0.0
+            or self.router_jitter >= 1.0
         ):
-            raise ValueError("norm_eps must be > 0 and logit_softcap / router_jitter must be finite >= 0")
+            raise ValueError(
+                "norm_eps must be > 0, logit_softcap finite >= 0, and router_jitter finite in [0, 1)"
+            )
         if self.max_seq_len < 1:
             raise ValueError(f"max_seq_len ({self.max_seq_len}) must be >= 1")
         if (

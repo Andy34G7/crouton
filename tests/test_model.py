@@ -228,8 +228,71 @@ def test_model_config_validation_and_optional_flags(tmp_path):
         left_out_b = model(left_b, attention_mask=left_mask).logits[:, 2:]
     assert torch.allclose(left_out_a, left_out_b, atol=1e-6)
 
-    for bad_float in ({"rope_theta": float("nan")}, {"norm_eps": float("inf")}, {"router_jitter": float("nan")}):
+    for bad_float in (
+        {"rope_theta": float("nan")},
+        {"norm_eps": float("inf")},
+        {"router_jitter": float("nan")},
+        {"router_jitter": 1.0},
+        {"router_jitter": 1.5},
+    ):
         with pytest.raises(ValueError):
             CroutonConfig(**bad_float)
     with pytest.raises(ValueError):
         TrainConfig(muon_lr=float("nan"))
+
+    # Eager sparse CE slicing matches dense ignore_index=-100 loss and handles all-masked batches
+    cfg_ce = CroutonConfig(
+        vocab_size=32,
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        n_experts=2,
+        expert_rank=4,
+        max_seq_len=16,
+        use_flex_attention=False,
+    )
+    m_ce = CroutonForCausalLM(cfg_ce)
+    m_ce.eval()
+    ce_x = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.long)
+    ce_tgt = torch.tensor([[2, -100, 4, -100], [-100, 7, -100, -100]], dtype=torch.long)
+    m_ce.zero_grad()
+    out_ce = m_ce(ce_x, targets=ce_tgt)
+    ref_ce = torch.nn.functional.cross_entropy(
+        out_ce.logits.reshape(-1, cfg_ce.vocab_size).float(),
+        ce_tgt.reshape(-1),
+        ignore_index=-100,
+    )
+    assert torch.allclose(out_ce.loss, ref_ce, atol=1e-6, rtol=1e-6)
+    out_ce.loss.backward()
+    assert m_ce.tok_emb.weight.grad is not None and torch.isfinite(m_ce.tok_emb.weight.grad).all()
+
+    m_ce.zero_grad()
+    all_masked = torch.full_like(ce_tgt, -100)
+    out_zero = m_ce(ce_x, targets=all_masked)
+    assert out_zero.loss.item() == 0.0
+    out_zero.loss.backward()
+    assert torch.isfinite(m_ce.tok_emb.weight.grad).all()
+
+    # Preserve caller's first EOS token in eos_fill rather than sorting IDs
+    eos_steps = [
+        torch.tensor([[7], [2]], dtype=torch.long),
+        torch.tensor([[9], [9]], dtype=torch.long),
+    ]
+    orig_forward = m_ce.forward
+
+    def _mock_eos_forward(idx, *args, **kwargs):
+        logits = torch.full((idx.size(0), idx.size(1), cfg_ce.vocab_size), -10.0)
+        toks = eos_steps.pop(0) if eos_steps else torch.full((idx.size(0), 1), 9, dtype=torch.long)
+        for row_idx in range(idx.size(0)):
+            logits[row_idx, -1, int(toks[row_idx, 0].item())] = 10.0
+        return type("Out", (), {"logits": logits, "loss": None, "router_entropy": None})()
+
+    m_ce.forward = _mock_eos_forward  # type: ignore[method-assign]
+    try:
+        gen_eos = m_ce.generate(torch.tensor([[1], [1]], dtype=torch.long), max_new_tokens=2, eos_token_ids=[7, 3])
+        assert gen_eos[0].tolist() == [1, 7, 7]
+        assert gen_eos[1].tolist() == [1, 2, 9]
+    finally:
+        m_ce.forward = orig_forward  # type: ignore[method-assign]

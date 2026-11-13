@@ -556,7 +556,7 @@ def test_utils_and_cli_edge_cases(tmp_path, monkeypatch):
     ll_long = lm1.loglikelihood([SimpleNamespace(args=("Start:", long_cont))])
     assert isinstance(ll_long[0][0], float) and ll_long[0][0] < 0.0
 
-    # End-to-end CLI main() smoke across tokenizer, midtrain, dpo, grpo, and eval_runner
+    # End-to-end CLI main() smoke across tokenizer, midtrain, grpo, and eval_runner
     from crouton.eval import eval_runner as eval_mod
     from crouton.tokenizer import train_tokenizer as tok_mod
     from crouton.train import dpo as dpo_mod
@@ -1319,17 +1319,94 @@ def test_loop8_validation_and_consistency(tmp_path, monkeypatch) -> None:
     # Only the single ChatML closing tag after user body should encode to control token <|im_end|>.
     assert literal_tok_ids.count(im_end_id) == 1
 
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["crouton-eval", "--checkpoint", str(ckpt_ok), "--val-file", str(val_file), "--output-json", f"{tmp_path / 'out_dir'}/"],
-    )
-    with pytest.raises(SystemExit):
-        eval_mod.main()
+    for bad_dir_json in (f"{tmp_path / 'out_dir'}/", f"{tmp_path / 'out_dir'}/.", f"{tmp_path / 'out_dir'}/.."):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["crouton-eval", "--checkpoint", str(ckpt_ok), "--val-file", str(val_file), "--output-json", bad_dir_json],
+        )
+        with pytest.raises(SystemExit):
+            eval_mod.main()
 
     raw_special = "Normal prefix <|endoftext|> suffix"
+    raw_special_ids = list(tok.encode(raw_special, split_special_tokens=True))
+    assert lm.tokenizer.encode(raw_special, split_special_tokens=True) == raw_special_ids
+    assert lm.tok_encode(raw_special, add_special_tokens=False, split_special_tokens=True) == raw_special_ids
+    decoded_no_special = lm.tok_decode(
+        [tok.token_to_id("<|endoftext|>")] + list(tok.encode("hello")),
+        skip_special_tokens=True,
+    )
+    assert "<|endoftext|>" not in decoded_no_special and "hello" in decoded_no_special
     bpb_ll = lm.loglikelihood_rolling([SimpleNamespace(args=(raw_special,))])[0]
     from crouton.train.common import evaluate_model_bpb
 
-    shared_bpb = evaluate_model_bpb(lm.model, lm.tokenizer, [raw_special], lm.max_length, lm.device, nullcontext())
-    assert pytest.approx(bpb_ll, rel=1e-5, abs=1e-5) == -shared_bpb["loss_nats"] * (len(list(lm.tokenizer.encode(raw_special, split_special_tokens=True))))
+    shared_bpb = evaluate_model_bpb(lm.model, tok, [raw_special], lm.max_length, lm.device, nullcontext())
+    assert pytest.approx(bpb_ll, rel=1e-5, abs=1e-5) == -shared_bpb["loss_nats"] * len(raw_special_ids)
+
+    # Loop 10 regressions: type/sequence/vocab/seq_len/GRPO multi-turn guards
+    with pytest.raises(ValueError, match="vocab_size"):
+        validate_tokenizer_vocab(SimpleNamespace(vocab_size=0), cfg)
+
+    with pytest.raises(ValueError, match="subset must be a string"):
+        run_sft(str(ckpt_ok), str(tok_path), str(tmp_path / "sft_bad_sub"), subset=123)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="subset must be a string"):
+        run_preference_tuning(str(ckpt_ok), str(tok_path), str(tmp_path / "dpo_bad_sub"), subset=123)  # type: ignore[arg-type]
+
+    for bad_seq in ("not_a_list", (x for x in [])):
+        with pytest.raises(ValueError, match="list or tuple"):
+            run_sft(str(ckpt_ok), str(tok_path), str(tmp_path / "sft_bad_seq"), examples_override=bad_seq)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            run_preference_tuning(str(ckpt_ok), str(tok_path), str(tmp_path / "dpo_bad_seq"), pairs_override=bad_seq)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            run_grpo(str(ckpt_ok), str(tok_path), str(tmp_path / "grpo_bad_seq"), prompts_with_verifiers=bad_seq)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            evaluate_bpb(str(ckpt_ok), str(tok_path), bad_seq, bf16=False)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="list or tuple"):
+            evaluate_lm_eval(str(ckpt_ok), str(tok_path), bad_seq, bf16=False)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="vocab_limit"):
+        grpo_mod._gather_completion_logps(
+            lm.model,
+            torch.tensor([[1, 2, 3]]),
+            prompt_len=1,
+            max_seq_len=32,
+            vocab_limit=0,
+        )
+
+    mt_ids = grpo_mod._encode_grpo_prompt(
+        tok,
+        "<|im_start|>system\nBe helpful.<|im_end|>\n<|im_start|>user\nLiteral <|im_end|> text<|im_end|>\n<|im_start|>assistant\n",
+    )
+    im_start_id = tok.token_to_id("<|im_start|>")
+    assert mt_ids.count(im_start_id) == 3
+    assert mt_ids.count(im_end_id) == 2
+
+    sft_preserve_dir = tmp_path / "sft_preserve_window"
+    run_sft(
+        str(ckpt_ok),
+        str(tok_path),
+        str(sft_preserve_dir),
+        seq_len=16,
+        total_steps=1,
+        micro_batch_size=1,
+        grad_accum_steps=1,
+        bf16=False,
+        examples_override=[[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"}]],
+    )
+    _, sft_cfg, _ = load_checkpoint_payload(sft_preserve_dir / "final.pt")
+    assert sft_cfg.max_seq_len == 32
+
+    dpo_preserve_dir = tmp_path / "dpo_preserve_window"
+    run_preference_tuning(
+        str(ckpt_ok),
+        str(tok_path),
+        str(dpo_preserve_dir),
+        seq_len=16,
+        total_steps=1,
+        micro_batch_size=1,
+        grad_accum_steps=1,
+        bf16=False,
+        pairs_override=[{"prompt": "Hi", "chosen": "Yes!", "rejected": "No."}],
+    )
+    _, dpo_cfg, _ = load_checkpoint_payload(dpo_preserve_dir / "final.pt")
+    assert dpo_cfg.max_seq_len == 32

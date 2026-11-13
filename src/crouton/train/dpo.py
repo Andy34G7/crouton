@@ -28,6 +28,7 @@ from crouton.train.common import (
     save_checkpoint,
     strip_required_paths,
     validate_output_dir,
+    validate_sequence_arg,
     validate_tokenizer_vocab,
 )
 
@@ -147,6 +148,7 @@ def run_preference_tuning(
         require_dataset=pairs_override is None,
     )
     if pairs_override is not None:
+        validate_sequence_arg(pairs_override, "pairs_override")
         if not pairs_override:
             raise ValueError(f"Preference dataset '{dataset_name}' yielded zero valid (prompt, chosen, rejected) pairs.")
         if not all(is_valid_preference_pair(p) for p in pairs_override):
@@ -157,7 +159,10 @@ def run_preference_tuning(
     use_bf16 = bf16 and bf16_supported(device)
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint, override_seq_len=seq_len)
+    ckpt, model_cfg, _ = load_checkpoint_payload(base_checkpoint)
+    if seq_len > model_cfg.max_seq_len:
+        model_cfg.max_seq_len = seq_len
+        model_cfg.__post_init__()
     tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
     validate_tokenizer_vocab(tokenizer, model_cfg)
 

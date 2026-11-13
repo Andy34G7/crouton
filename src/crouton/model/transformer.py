@@ -182,13 +182,21 @@ class CroutonForCausalLM(nn.Module):
 
         loss = None
         if targets is not None:
-            flat_logits = (logits_fp32 if logits_fp32 is not None else logits.float()).view(-1, logits.size(-1))
+            src_logits = logits_fp32 if logits_fp32 is not None else logits
+            flat_logits = src_logits.reshape(-1, src_logits.size(-1))
             flat_targets = targets.reshape(-1)
             valid_mask = flat_targets != -100
-            safe_targets = torch.where(valid_mask, flat_targets, 0)
-            tok_loss = F.cross_entropy(flat_logits, safe_targets, reduction="none")
-            valid_f = valid_mask.float()
-            loss = (tok_loss * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+            if not torch.compiler.is_compiling():
+                if bool(valid_mask.any()):
+                    # Only promote active supervised rows to fp32 when running eagerly (matches dpo.sequence_logps).
+                    loss = F.cross_entropy(flat_logits[valid_mask].float(), flat_targets[valid_mask], reduction="mean")
+                else:
+                    loss = flat_logits[:1, :1].float().sum() * 0.0
+            else:
+                safe_targets = torch.where(valid_mask, flat_targets, 0)
+                tok_loss = F.cross_entropy(flat_logits.float(), safe_targets, reduction="none")
+                valid_f = valid_mask.float()
+                loss = (tok_loss * valid_f).sum() / valid_f.sum().clamp(min=1.0)
 
         router_entropy = torch.stack(entropies).mean() if entropies else None
         return CroutonOutput(logits=logits, loss=loss, router_entropy=router_entropy)
@@ -212,7 +220,7 @@ class CroutonForCausalLM(nn.Module):
         self.eval()
         try:
             eos_tensor = (
-                torch.tensor(sorted(set(eos_token_ids)), dtype=torch.long, device=input_ids.device)
+                torch.tensor(list(dict.fromkeys(int(t) for t in eos_token_ids)), dtype=torch.long, device=input_ids.device)
                 if eos_token_ids
                 else None
             )

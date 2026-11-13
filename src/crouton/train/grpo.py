@@ -26,6 +26,7 @@ from crouton.train.common import (
     save_checkpoint,
     strip_required_paths,
     validate_output_dir,
+    validate_sequence_arg,
     validate_tokenizer_vocab,
 )
 
@@ -169,6 +170,8 @@ def _gather_completion_logps(
         start_logit = prompt_len - 1
     logits = model(inp).logits[:, start_logit:, :].float()
     if vocab_limit is not None:
+        if vocab_limit < 1:
+            raise ValueError("vocab_limit must be >= 1 when specified")
         logits = logits[..., :vocab_limit]
     tgt = tgt[:, -logits.size(1) :]
     log_probs = F.log_softmax(logits, dim=-1)
@@ -199,22 +202,35 @@ def _validate_grpo_args(
         raise ValueError("temperature and lr must be finite > 0, and kl_beta / save_interval must be finite >= 0")
 
 
-_CHATML_PREFIX = "<|im_start|>user\n"
-_CHATML_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n"
+_CHATML_TURN_RE = re.compile(
+    r"<\|im_start\|>([A-Za-z0-9_-]+)\n(.*?)<\|im_end\|>\n(?=<\|im_start\|>[A-Za-z0-9_-]+\n|$)",
+    re.DOTALL,
+)
+_CHATML_OPEN_TURN_RE = re.compile(r"<\|im_start\|>([A-Za-z0-9_-]+)\n$")
 
 
 def _encode_grpo_prompt(tokenizer: WpBpePpigTokenizer, prompt: str) -> list[int]:
-    """Encode ChatML prompts while isolating raw user text from control tokens."""
-    if prompt.startswith(_CHATML_PREFIX) and prompt.endswith(_CHATML_SUFFIX):
-        body = prompt[len(_CHATML_PREFIX) : len(prompt) - len(_CHATML_SUFFIX)]
-        return (
-            list(tokenizer.encode("<|im_start|>"))
-            + list(tokenizer.encode("user\n", split_special_tokens=True))
-            + list(tokenizer.encode(body, split_special_tokens=True))
-            + list(tokenizer.encode("<|im_end|>\n"))
-            + list(tokenizer.encode("<|im_start|>"))
-            + list(tokenizer.encode("assistant\n", split_special_tokens=True))
-        )
+    """Encode single- or multi-turn ChatML prompts while isolating raw turn text from control tokens."""
+    ids: list[int] = []
+    pos = 0
+    while (match := _CHATML_TURN_RE.match(prompt, pos)) is not None:
+        role, body = match.group(1), match.group(2)
+        ids.extend(tokenizer.encode("<|im_start|>"))
+        ids.extend(tokenizer.encode(f"{role}\n", split_special_tokens=True))
+        ids.extend(tokenizer.encode(body, split_special_tokens=True))
+        ids.extend(tokenizer.encode("<|im_end|>\n"))
+        pos = match.end()
+
+    if pos == len(prompt) and pos > 0:
+        return ids
+
+    tail_match = _CHATML_OPEN_TURN_RE.fullmatch(prompt, pos)
+    if tail_match is not None:
+        role = tail_match.group(1)
+        ids.extend(tokenizer.encode("<|im_start|>"))
+        ids.extend(tokenizer.encode(f"{role}\n", split_special_tokens=True))
+        return ids
+
     return list(tokenizer.encode(prompt, split_special_tokens=True))
 
 
@@ -240,6 +256,7 @@ def run_grpo(
         output_dir=output_dir,
     )
     validate_output_dir(output_dir)
+    validate_sequence_arg(prompts_with_verifiers, "prompts_with_verifiers")
     if not prompts_with_verifiers:
         raise ValueError("prompts_with_verifiers must be non-empty")
     task_list: list[tuple[str, Callable[[str], float]]] = []
