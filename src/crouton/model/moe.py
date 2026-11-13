@@ -37,7 +37,7 @@ class MergedLoRADenseMoE(nn.Module):
         # Learned softmax router
         self.router = nn.Linear(self.d_model, self.n_experts, bias=False)
 
-        # Low-rank expert deltas (LoRA-style: A initialized kaiming/normal, B initialized near zero)
+        # Low-rank expert deltas (LoRA-style: A normal with std=1/sqrt(fan_in), B initialized to zero)
         self.up_A = nn.Parameter(torch.empty(self.n_experts, self.d_model, self.rank))
         self.up_B = nn.Parameter(torch.zeros(self.n_experts, self.rank, self.d_ff))
         self.down_A = nn.Parameter(torch.empty(self.n_experts, self.d_ff, self.rank))

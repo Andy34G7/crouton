@@ -256,6 +256,8 @@ def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
     out_tok = tmp_path / "cli_tok.json"
 
     for bad_argv in (
+        ["crouton-train-tokenizer", "--output", ""],
+        ["crouton-train-tokenizer", "--output", "   "],
         ["crouton-train-tokenizer", "--local-file", ""],
         ["crouton-train-tokenizer", "--local-file", "   "],
         ["crouton-train-tokenizer", "--local-file", str(text_file), "--split", "val"],
@@ -265,6 +267,8 @@ def test_train_tokenizer_cli_validation(tmp_path, monkeypatch):
         monkeypatch.setattr(sys, "argv", bad_argv)
         with pytest.raises(SystemExit):
             tok_cli.main()
+    with pytest.raises(ValueError, match="output_path"):
+        train_crouton_tokenizer(["hello world"], output_path="   ", vocab_size=260)
 
     seen: dict[str, object] = {}
 

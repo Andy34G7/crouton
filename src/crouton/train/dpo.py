@@ -26,6 +26,7 @@ from crouton.train.common import (
     next_or_restart,
     normalize_optional_subset,
     save_checkpoint,
+    strip_required_paths,
     validate_tokenizer_vocab,
 )
 
@@ -125,6 +126,12 @@ def run_preference_tuning(
     seed: int = 42,
     pairs_override: list[dict[str, Any]] | None = None,
 ) -> None:
+    base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
+        base_checkpoint=base_checkpoint,
+        tokenizer_path=tokenizer_path,
+        output_dir=output_dir,
+    )
+    subset = normalize_optional_subset(subset)
     _validate_dpo_args(
         seq_len=seq_len,
         total_steps=total_steps,
@@ -168,6 +175,15 @@ def run_preference_tuning(
     if not pairs:
         raise ValueError(f"Preference dataset '{dataset_name}' yielded zero valid (prompt, chosen, rejected) pairs.")
 
+    ds = PreferenceDataset(pairs, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
+    if not any(
+        bool((item["chosen_labels"] != -100).any() and (item["rejected_labels"] != -100).any())
+        for item in (ds[i] for i in range(len(ds)))
+    ):
+        raise ValueError(
+            f"Preference dataset '{dataset_name}' yields zero pairs with both chosen and rejected supervision at seq_len={seq_len}."
+        )
+
     policy = instantiate_checkpoint_model(ckpt, model_cfg, device)
     ref_model = None
     if not use_orpo:
@@ -177,7 +193,6 @@ def run_preference_tuning(
             p.requires_grad = False
 
     pad_mult = 128 if (device.type == "cuda" and model_cfg.use_flex_attention and torch.cuda.get_device_capability(device)[0] >= 8) else 1
-    ds = PreferenceDataset(pairs, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
     loader = DataLoader(
         ds,
         batch_size=micro_batch_size,
@@ -282,9 +297,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    if not args.base_checkpoint.strip() or not args.tokenizer.strip():
-        parser.error("--base-checkpoint and --tokenizer must be non-empty")
     try:
+        base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
+            **{
+                "--base-checkpoint": args.base_checkpoint,
+                "--tokenizer": args.tokenizer,
+                "--output-dir": args.output_dir,
+            }
+        )
         _validate_dpo_args(
             seq_len=args.seq_len,
             total_steps=args.steps,
@@ -301,9 +321,9 @@ def main() -> None:
 
     subset = normalize_optional_subset(args.subset)
     run_preference_tuning(
-        base_checkpoint=args.base_checkpoint,
-        tokenizer_path=args.tokenizer,
-        output_dir=args.output_dir,
+        base_checkpoint=base_checkpoint,
+        tokenizer_path=tokenizer_path,
+        output_dir=output_dir,
         dataset_name=args.dataset.strip(),
         subset=subset,
         seq_len=args.seq_len,

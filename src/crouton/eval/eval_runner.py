@@ -20,6 +20,7 @@ from crouton.train.common import (
     instantiate_checkpoint_model,
     load_checkpoint_payload,
     safe_decode,
+    strip_required_paths,
     validate_tokenizer_vocab,
 )
 
@@ -70,6 +71,10 @@ class CroutonLM(LMEvalBase):  # type: ignore[valid-type,misc]
     ) -> None:
         if batch_size < 1 or max_gen_toks < 1:
             raise ValueError("batch_size and max_gen_toks must be >= 1")
+        checkpoint_path, tokenizer_path = strip_required_paths(
+            checkpoint_path=checkpoint_path,
+            tokenizer_path=tokenizer_path,
+        )
         ckpt, self.model_cfg, _ = load_checkpoint_payload(checkpoint_path)
         raw_tokenizer = WpBpePpigTokenizer.from_pretrained(tokenizer_path)
         validate_tokenizer_vocab(raw_tokenizer, self.model_cfg)
@@ -345,6 +350,10 @@ def evaluate_bpb(
     for fair comparison across tokenizers (e.g., crouton vs shortcake).
     Prepends EOS so every token in each document is scored.
     """
+    checkpoint_path, tokenizer_path = strip_required_paths(
+        checkpoint_path=checkpoint_path,
+        tokenizer_path=tokenizer_path,
+    )
     if seq_len is not None and seq_len < 1:
         raise ValueError("seq_len must be >= 1")
     if not texts or not all(isinstance(t, str) for t in texts) or not any(t.strip() for t in texts):
@@ -377,6 +386,10 @@ def evaluate_lm_eval(
         raise ValueError("tasks must be non-empty")
     if not HAS_LM_EVAL:
         raise RuntimeError("lm-eval is not installed. Install with: uv sync --extra dev --extra eval")
+    checkpoint_path, tokenizer_path = strip_required_paths(
+        checkpoint_path=checkpoint_path,
+        tokenizer_path=tokenizer_path,
+    )
     lm = CroutonLM(checkpoint_path=checkpoint_path, tokenizer_path=tokenizer_path, batch_size=batch_size, bf16=bf16)
     results = lm_eval.simple_evaluate(model=lm, tasks=tasks, limit=limit)
     return results.get("results", {})
@@ -410,8 +423,11 @@ def main() -> None:
         parser.error("--val-file must be a non-empty path")
 
     output_json = args.output_json.strip() if args.output_json is not None else None
-    if output_json is not None and not output_json:
-        parser.error("--output-json must be a non-empty path")
+    if output_json is not None:
+        if not output_json:
+            parser.error("--output-json must be a non-empty path")
+        if Path(output_json).is_dir():
+            parser.error("--output-json must be a file path, not a directory")
 
     if val_file is None and args.tasks is None:
         parser.error("Provide at least one of --val-file or --tasks")

@@ -23,6 +23,7 @@ from crouton.train.common import (
     load_checkpoint_payload,
     safe_decode,
     save_checkpoint,
+    strip_required_paths,
     validate_tokenizer_vocab,
 )
 
@@ -89,8 +90,10 @@ def load_gsm8k_tasks(max_examples: int = 1000) -> list[tuple[str, Callable[[str]
     ds = load_dataset("openai/gsm8k", "main", split="train", streaming=True)
     tasks: list[tuple[str, Callable[[str], float]]] = []
     for row in ds:
-        q = str(row.get("question", "")).strip()
-        ans = extract_numeric_answer(str(row.get("answer", "")))
+        raw_q = row.get("question")
+        raw_a = row.get("answer")
+        q = raw_q.strip() if isinstance(raw_q, str) else ""
+        ans = extract_numeric_answer(raw_a) if isinstance(raw_a, str) else None
         if q and ans is not None:
             prompt = (
                 f"<|im_start|>user\n{q}\nEnd your final answer with #### <number>.<|im_end|>\n"
@@ -209,6 +212,11 @@ def run_grpo(
     save_interval: int = 0,
     seed: int = 42,
 ) -> None:
+    base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
+        base_checkpoint=base_checkpoint,
+        tokenizer_path=tokenizer_path,
+        output_dir=output_dir,
+    )
     if not prompts_with_verifiers:
         raise ValueError("prompts_with_verifiers must be non-empty")
     _validate_grpo_args(

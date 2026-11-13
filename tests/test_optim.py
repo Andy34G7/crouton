@@ -879,3 +879,141 @@ def test_sequence_logps_early_validation_cli_and_eval_guards(tmp_path, monkeypat
         )
         with pytest.raises(ValueError, match="vocab"):
             eval_mod.main()
+
+    # 6. Loop 7 validation hardening: output-dir/path guards, payload schema, GSM8K None, zero-supervision datasets
+    from crouton.train.common import load_checkpoint_payload
+    from crouton.train.grpo import load_gsm8k_tasks
+
+    with pytest.raises(ValueError, match="output_dir"):
+        TrainConfig(output_dir="   ")
+
+    for fn, bad_argv in (
+        (midtrain_mod.main, ["crouton-midtrain", "--base-checkpoint", str(ckpt_ok), "--output-dir", "   "]),
+        (sft_mod.main, ["crouton-sft", "--base-checkpoint", str(ckpt_ok), "--output-dir", "   "]),
+        (dpo_mod.main, ["crouton-dpo", "--base-checkpoint", str(ckpt_ok), "--output-dir", "   "]),
+        (eval_mod.main, ["crouton-eval", "--checkpoint", str(ckpt_ok), "--val-file", str(val_file), "--output-json", str(tmp_path)]),
+    ):
+        monkeypatch.setattr(sys, "argv", bad_argv)
+        with pytest.raises(SystemExit):
+            fn()
+
+    with monkeypatch.context() as mp:
+        seen_paths: dict[str, object] = {}
+        mp.setattr(midtrain_mod, "run_midtrain", lambda **kw: seen_paths.update(kw))
+        mp.setattr(
+            sys,
+            "argv",
+            [
+                "crouton-midtrain",
+                "--base-checkpoint",
+                f"  {ckpt_ok}  ",
+                "--tokenizer",
+                f"  {tok_path}  ",
+                "--output-dir",
+                f"  {tmp_path / 'mid_out'}  ",
+            ],
+        )
+        midtrain_mod.main()
+        assert seen_paths["base_checkpoint"] == str(ckpt_ok)
+        assert seen_paths["tokenizer_path"] == str(tok_path)
+        assert seen_paths["output_dir"] == str(tmp_path / "mid_out")
+
+    ckpt_empty_model = tmp_path / "empty_model.pt"
+    torch.save({"config": cfg.to_dict(), "model": {}}, ckpt_empty_model)
+    with pytest.raises(ValueError, match="model"):
+        load_checkpoint_payload(ckpt_empty_model)
+
+    ckpt_bad_shape = tmp_path / "bad_shape.pt"
+    bad_sd = dict(torch.load(ckpt_ok, map_location="cpu", weights_only=False)["model"])
+    bad_sd["tok_emb.weight"] = torch.zeros(2, 2)
+    torch.save({"config": cfg.to_dict(), "model": bad_sd}, ckpt_bad_shape)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        load_checkpoint_payload(ckpt_bad_shape)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            eval_mod,
+            "evaluate_bpb",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should fail corrupt compare checkpoint before primary eval")),
+        )
+        mp.setattr(
+            sys,
+            "argv",
+            [
+                "crouton-eval",
+                "--checkpoint",
+                str(ckpt_ok),
+                "--compare-checkpoint",
+                str(ckpt_bad_shape),
+                "--tokenizer",
+                str(tok_path),
+                "--val-file",
+                str(val_file),
+                "--no-bf16",
+            ],
+        )
+        with pytest.raises(ValueError, match="shape mismatch"):
+            eval_mod.main()
+
+    with pytest.raises(ValueError, match="non-empty"):
+        evaluate_bpb("   ", str(tok_path), ["hello"], seq_len=16, bf16=False)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            sft_mod,
+            "instantiate_checkpoint_model",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should reject all-unsupervised SFT before model alloc")),
+        )
+        with pytest.raises(ValueError, match="zero supervised"):
+            run_sft(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "sft_nosup"),
+                seq_len=16,
+                total_steps=1,
+                micro_batch_size=1,
+                grad_accum_steps=1,
+                bf16=False,
+                examples_override=[[{"role": "user", "content": "Only user message"}]],
+            )
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            dpo_mod,
+            "instantiate_checkpoint_model",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should reject all-unsupervised DPO before model alloc")),
+        )
+        with pytest.raises(ValueError, match="zero pairs"):
+            run_preference_tuning(
+                str(ckpt_ok),
+                str(tok_path),
+                str(tmp_path / "dpo_nosup"),
+                seq_len=16,
+                total_steps=1,
+                micro_batch_size=1,
+                grad_accum_steps=1,
+                bf16=False,
+                pairs_override=[
+                    {
+                        "prompt": [{"role": "user", "content": "Q"}],
+                        "chosen": [{"role": "user", "content": "no assistant"}],
+                        "rejected": [{"role": "user", "content": "also no assistant"}],
+                    }
+                ],
+            )
+
+    import datasets as hf_datasets
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            hf_datasets,
+            "load_dataset",
+            lambda *a, **kw: [
+                {"question": None, "answer": "#### 5"},
+                {"question": "2+2?", "answer": None},
+                {"question": "1+1?", "answer": "#### 2"},
+            ],
+        )
+        gsm_tasks = load_gsm8k_tasks(max_examples=5)
+        assert len(gsm_tasks) == 1
+        assert "1+1?" in gsm_tasks[0][0] and "None" not in gsm_tasks[0][0]
+        assert gsm_tasks[0][1]("#### 2") == 1.0

@@ -21,6 +21,7 @@ from crouton.train.common import (
     next_or_restart,
     normalize_optional_subset,
     save_checkpoint,
+    strip_required_paths,
     validate_tokenizer_vocab,
 )
 
@@ -58,6 +59,8 @@ def _validate_midtrain_args(
         )
     if dataset_name is not None and (not isinstance(dataset_name, str) or not dataset_name.strip()):
         raise ValueError("dataset_name must be non-empty when specified")
+    if local_file is not None and (not isinstance(local_file, str) or not local_file.strip()):
+        raise ValueError("local_file must be non-empty when specified")
     if not isinstance(split, str) or not split.strip() or not isinstance(text_field, str) or not text_field.strip():
         raise ValueError("split and text_field must be non-empty")
     if subset is not None and not dataset_name:
@@ -88,6 +91,12 @@ def run_midtrain(
     save_interval: int = 0,
     seed: int = 42,
 ) -> None:
+    base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
+        base_checkpoint=base_checkpoint,
+        tokenizer_path=tokenizer_path,
+        output_dir=output_dir,
+    )
+    subset = normalize_optional_subset(subset)
     _validate_midtrain_args(
         seq_len=seq_len,
         total_steps=total_steps,
@@ -104,6 +113,10 @@ def run_midtrain(
         text_field=text_field,
         local_file=local_file,
     )
+    dataset_name = dataset_name.strip() if dataset_name is not None else None
+    split = split.strip()
+    text_field = text_field.strip()
+    local_file = local_file.strip() if local_file is not None else None
 
     local_texts = None
     if local_file is not None:
@@ -206,13 +219,26 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    if not args.base_checkpoint.strip() or not args.tokenizer.strip():
-        parser.error("--base-checkpoint and --tokenizer must be non-empty")
-    if args.local_file is not None:
-        if not args.local_file.strip():
+    try:
+        base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
+            **{
+                "--base-checkpoint": args.base_checkpoint,
+                "--tokenizer": args.tokenizer,
+                "--output-dir": args.output_dir,
+            }
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    local_file = args.local_file.strip() if args.local_file is not None else None
+    if local_file is not None:
+        if not local_file:
             parser.error("--local-file must be a non-empty file path")
         if args.dataset is not None or args.subset is not None or args.split != "train" or args.text_field != "text":
             parser.error("--local-file cannot be combined with --dataset, --subset, --split, or --text-field")
+    dataset_name = args.dataset.strip() if args.dataset is not None else None
+    subset = normalize_optional_subset(args.subset)
+    split = args.split.strip()
+    text_field = args.text_field.strip()
     try:
         _validate_midtrain_args(
             seq_len=args.seq_len,
@@ -226,19 +252,17 @@ def main() -> None:
             rope_scale_factor=args.rope_scale,
             dataset_name=args.dataset,
             subset=args.subset,
-            split=args.split,
-            text_field=args.text_field,
-            local_file=args.local_file,
+            split=split,
+            text_field=text_field,
+            local_file=local_file,
         )
     except ValueError as exc:
         parser.error(str(exc))
 
-    dataset_name = args.dataset.strip() if args.dataset is not None else None
-    subset = normalize_optional_subset(args.subset)
     run_midtrain(
-        base_checkpoint=args.base_checkpoint,
-        tokenizer_path=args.tokenizer,
-        output_dir=args.output_dir,
+        base_checkpoint=base_checkpoint,
+        tokenizer_path=tokenizer_path,
+        output_dir=output_dir,
         seq_len=args.seq_len,
         rope_scale_factor=args.rope_scale,
         rope_scaling_type=args.rope_scaling,
@@ -250,9 +274,9 @@ def main() -> None:
         adamw_lr=args.adamw_lr,
         dataset_name=dataset_name,
         subset=subset,
-        split=args.split.strip(),
-        text_field=args.text_field.strip(),
-        local_file=args.local_file.strip() if args.local_file is not None else None,
+        split=split,
+        text_field=text_field,
+        local_file=local_file,
         bf16=not args.no_bf16,
         save_interval=args.save_interval,
         seed=args.seed,

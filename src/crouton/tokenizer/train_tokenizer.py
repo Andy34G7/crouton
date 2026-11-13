@@ -62,6 +62,9 @@ def train_crouton_tokenizer(
     individual_digits: bool = True,
 ) -> WpBpePpigTokenizer:
     """Train WpBpePpigTokenizer with crouton pretokenizer and export to `output_path`."""
+    out_str = str(output_path).strip()
+    if not out_str:
+        raise ValueError("output_path must be non-empty")
     if (
         vocab_size < MIN_VOCAB_SIZE
         or min_frequency < 1
@@ -87,7 +90,7 @@ def train_crouton_tokenizer(
         special_tokens=DEFAULT_SPECIAL_TOKENS,
         pretokenizer=pretokenizer,
     )
-    out = Path(output_path)
+    out = Path(out_str)
     if out.suffix == ".json":
         out.parent.mkdir(parents=True, exist_ok=True)
         tok.export_hf_json(str(out))
@@ -111,6 +114,9 @@ def main() -> None:
     parser.add_argument("--text-field", type=str, default="text")
     parser.add_argument("--max-docs", type=int, default=50000)
     args = parser.parse_args()
+    output_path = args.output.strip()
+    if not output_path:
+        parser.error("--output must be non-empty")
     if (
         args.vocab_size < MIN_VOCAB_SIZE
         or args.min_frequency < 1
@@ -125,8 +131,9 @@ def main() -> None:
         parser.error("--dataset must be a non-empty dataset name")
     if not args.split.strip() or not args.text_field.strip():
         parser.error("--split and --text-field must be non-empty")
-    if args.local_file is not None:
-        if not args.local_file.strip():
+    local_file = args.local_file.strip() if args.local_file is not None else None
+    if local_file is not None:
+        if not local_file:
             parser.error("--local-file must be a non-empty file path")
         if (
             args.dataset is not None
@@ -138,10 +145,10 @@ def main() -> None:
     if args.subset is not None and args.dataset is None:
         parser.error("--subset requires --dataset")
 
-    if args.local_file is not None:
-        corpus = read_local_corpus(args.local_file.strip())
+    if local_file is not None:
+        corpus = read_local_corpus(local_file)
         if not corpus or not any(line.strip() for line in corpus):
-            raise ValueError(f"Local tokenizer corpus {args.local_file!r} contains no non-empty text")
+            raise ValueError(f"Local tokenizer corpus {local_file!r} contains no non-empty text")
     elif args.dataset is not None:
         raw_sub = args.subset.strip() if args.subset is not None else None
         subset = None if raw_sub in (None, "", "none", "None") else raw_sub
@@ -154,13 +161,13 @@ def main() -> None:
 
     tok = train_crouton_tokenizer(
         corpus=corpus,
-        output_path=args.output,
+        output_path=output_path,
         vocab_size=args.vocab_size,
         length_penalty=args.length_penalty,
         min_frequency=args.min_frequency,
         individual_digits=not args.no_individual_digits,
     )
-    print(f"Saved wp-bpe-ppig tokenizer (vocab_size={tok.vocab_size}) to {args.output}")
+    print(f"Saved wp-bpe-ppig tokenizer (vocab_size={tok.vocab_size}) to {output_path}")
 
 
 if __name__ == "__main__":

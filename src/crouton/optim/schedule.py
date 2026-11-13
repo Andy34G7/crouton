@@ -14,7 +14,7 @@ def wsd_lr_multiplier(
     decay_steps: int,
     min_lr_ratio: float = 0.1,
 ) -> float:
-    """Compute WSD learning-rate multiplier in [min_lr_ratio, 1.0]."""
+    """Compute WSD learning-rate multiplier (linear warmup in (0, 1], stable 1.0, cosine decay to min_lr_ratio)."""
     if step < warmup_steps:
         return float(step + 1) / float(max(1, warmup_steps))
     decay_start = max(warmup_steps, total_steps - decay_steps)

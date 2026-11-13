@@ -38,6 +38,16 @@ def normalize_optional_subset(subset: str | None) -> str | None:
     return None if cleaned in ("", "none", "None") else cleaned
 
 
+def strip_required_paths(**named_paths: str) -> tuple[str, ...]:
+    """Validate and strip required path/identifier strings in argument order."""
+    cleaned: list[str] = []
+    for label, value in named_paths.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must be non-empty")
+        cleaned.append(value.strip())
+    return tuple(cleaned)
+
+
 def validate_tokenizer_vocab(tokenizer, model_cfg: CroutonConfig) -> None:
     """Fail fast if the tokenizer produces IDs beyond the model embedding table."""
     if tokenizer.vocab_size > model_cfg.vocab_size:
@@ -179,9 +189,17 @@ def load_checkpoint_payload(
     override_rope_scale: float | None = None,
     override_rope_scaling_type: str | None = None,
 ) -> tuple[dict[str, Any], CroutonConfig, int]:
-    """Load checkpoint payload and validated CroutonConfig on CPU before GPU/network setup."""
+    """Load checkpoint payload, validated CroutonConfig, and model state schema on CPU before GPU/network setup."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    cfg_dict = dict(ckpt["config"])
+    if not isinstance(ckpt, dict):
+        raise ValueError(f"Checkpoint {path!r} payload must be a dict, got {type(ckpt).__name__}")
+    raw_cfg = ckpt.get("config")
+    raw_model = ckpt.get("model")
+    if not isinstance(raw_cfg, dict):
+        raise ValueError(f"Checkpoint {path!r} is missing a valid 'config' dict")
+    if not isinstance(raw_model, dict) or not raw_model or not all(isinstance(k, str) for k in raw_model):
+        raise ValueError(f"Checkpoint {path!r} is missing a valid 'model' state_dict")
+    cfg_dict = dict(raw_cfg)
     if "rope_original_max_seq_len" not in cfg_dict:
         cfg_dict["rope_original_max_seq_len"] = cfg_dict.get("max_seq_len", 2048)
     if override_seq_len is not None:
@@ -191,6 +209,23 @@ def load_checkpoint_payload(
     if override_rope_scaling_type is not None:
         cfg_dict["rope_scaling_type"] = override_rope_scaling_type
     cfg = CroutonConfig(**cfg_dict)
+    clean_sd = strip_orig_mod_prefix(raw_model)
+    with torch.device("meta"):
+        expected_sd = CroutonForCausalLM(cfg).state_dict()
+    if clean_sd.keys() != expected_sd.keys():
+        missing = sorted(expected_sd.keys() - clean_sd.keys())
+        unexpected = sorted(clean_sd.keys() - expected_sd.keys())
+        raise ValueError(
+            f"Checkpoint {path!r} state_dict keys do not match CroutonConfig "
+            f"(missing={missing[:5]}, unexpected={unexpected[:5]})"
+        )
+    for k, expected_t in expected_sd.items():
+        actual_t = clean_sd[k]
+        if not isinstance(actual_t, torch.Tensor) or tuple(actual_t.shape) != tuple(expected_t.shape):
+            raise ValueError(
+                f"Checkpoint {path!r} tensor {k!r} shape mismatch: expected {tuple(expected_t.shape)}, got "
+                f"{tuple(actual_t.shape) if isinstance(actual_t, torch.Tensor) else type(actual_t).__name__}"
+            )
     return ckpt, cfg, int(ckpt.get("step", 0))
 
 

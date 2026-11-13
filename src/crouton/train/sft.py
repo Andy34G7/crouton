@@ -24,6 +24,7 @@ from crouton.train.common import (
     next_or_restart,
     normalize_optional_subset,
     save_checkpoint,
+    strip_required_paths,
     validate_tokenizer_vocab,
 )
 
@@ -69,6 +70,12 @@ def run_sft(
     save_interval: int = 0,
     seed: int = 42,
 ) -> None:
+    base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
+        base_checkpoint=base_checkpoint,
+        tokenizer_path=tokenizer_path,
+        output_dir=output_dir,
+    )
+    subset = normalize_optional_subset(subset)
     _validate_sft_args(
         seq_len=seq_len,
         total_steps=total_steps,
@@ -109,9 +116,12 @@ def run_sft(
     if not examples:
         raise ValueError(f"SFT dataset '{dataset_name}' yielded zero valid 'messages' examples.")
 
+    ds = SFTDataset(examples, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
+    if not any(bool((ds[i][1] != -100).any()) for i in range(len(ds))):
+        raise ValueError(f"SFT dataset '{dataset_name}' yields zero supervised assistant tokens at seq_len={seq_len}.")
+
     model = instantiate_checkpoint_model(ckpt, model_cfg, device)
     pad_mult = 128 if (device.type == "cuda" and model_cfg.use_flex_attention and torch.cuda.get_device_capability(device)[0] >= 8) else 1
-    ds = SFTDataset(examples, tokenizer=tokenizer, seq_len=seq_len, pad_to_max=False)
     loader = DataLoader(
         ds,
         batch_size=micro_batch_size,
@@ -182,8 +192,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    if not args.base_checkpoint.strip() or not args.tokenizer.strip():
-        parser.error("--base-checkpoint and --tokenizer must be non-empty")
+    try:
+        base_checkpoint, tokenizer_path, output_dir = strip_required_paths(
+            **{
+                "--base-checkpoint": args.base_checkpoint,
+                "--tokenizer": args.tokenizer,
+                "--output-dir": args.output_dir,
+            }
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     norm_sub = normalize_optional_subset(args.subset)
     if args.preset is not None:
         if args.dataset is not None:
@@ -211,9 +229,9 @@ def main() -> None:
         parser.error(str(exc))
 
     run_sft(
-        base_checkpoint=args.base_checkpoint,
-        tokenizer_path=args.tokenizer,
-        output_dir=args.output_dir,
+        base_checkpoint=base_checkpoint,
+        tokenizer_path=tokenizer_path,
+        output_dir=output_dir,
         dataset_name=dataset_name,
         subset=subset,
         seq_len=args.seq_len,

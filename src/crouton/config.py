@@ -135,6 +135,15 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         if (
+            not isinstance(self.output_dir, str)
+            or not self.output_dir.strip()
+            or not isinstance(self.tokenizer_path, str)
+            or not self.tokenizer_path.strip()
+        ):
+            raise ValueError("output_dir and tokenizer_path must be non-empty")
+        self.output_dir = self.output_dir.strip()
+        self.tokenizer_path = self.tokenizer_path.strip()
+        if (
             self.seq_len < 1
             or self.micro_batch_size < 1
             or self.grad_accum_steps < 1
