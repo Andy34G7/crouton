@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
@@ -28,6 +29,8 @@ class CroutonOutput:
     logits: torch.Tensor
     loss: torch.Tensor | None = None
     router_entropy: torch.Tensor | None = None
+    router_z_loss: torch.Tensor | None = None
+    past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
 
 class CroutonBlock(nn.Module):
@@ -48,18 +51,34 @@ class CroutonBlock(nn.Module):
         attention_mask: torch.Tensor | None = None,
         swa_block_mask: object | None = None,
         precomputed_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = x + self.attn(
+        is_right_padded: bool = False,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+        return_z_loss: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
+        attn_res = self.attn(
             self.attn_norm(x),
             cos,
             sin,
             attention_mask=attention_mask,
             swa_block_mask=swa_block_mask,
             precomputed_mask=precomputed_mask,
+            is_right_padded=is_right_padded,
+            past_kv=past_kv,
+            use_cache=use_cache,
         )
-        moe_out, router_weights = self.moe(self.moe_norm(x))
+        if use_cache:
+            attn_out, present_kv = attn_res  # type: ignore[misc]
+        else:
+            attn_out, present_kv = attn_res, None  # type: ignore[assignment]
+        x = x + attn_out
+        if return_z_loss:
+            moe_out, router_weights, z_loss = self.moe(self.moe_norm(x), return_z_loss=True)  # type: ignore[misc]
+        else:
+            moe_out, router_weights = self.moe(self.moe_norm(x))  # type: ignore[misc]
+            z_loss = None
         x = x + moe_out
-        return x, router_weights
+        return x, router_weights, z_loss, present_kv
 
 
 class CroutonForCausalLM(nn.Module):
@@ -91,6 +110,10 @@ class CroutonForCausalLM(nn.Module):
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
+        resid_std = 0.02 / math.sqrt(2.0 * config.n_layers)
+        for block in self.blocks:
+            nn.init.normal_(block.attn.wo.weight, mean=0.0, std=resid_std)
+            nn.init.normal_(block.moe.w_down.weight, mean=0.0, std=resid_std)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -111,60 +134,79 @@ class CroutonForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        is_right_padded: bool = False,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        use_cache: bool = False,
     ) -> CroutonOutput:
         _, seq_len = input_ids.shape
         device = input_ids.device
+        past_len = past_key_values[0][0].size(2) if past_key_values else 0
 
         # Check right-padded masks and fetch any @torch.compiler.disable FlexAttention mask
         # before entering embedding/RoPE/transformer tensor ops so compiled graphs stay contiguous.
         # Under strictly causal attention with right-padding, valid queries (q < valid_len) never
         # attend to trailing pad keys (kv >= valid_len), avoiding O(T^2) 4D mask materialization.
-        if attention_mask is not None and not torch.compiler.is_compiling() and _is_right_padded(attention_mask):
+        if attention_mask is not None and (
+            is_right_padded or (not torch.compiler.is_compiling() and _is_right_padded(attention_mask))
+        ):
             attention_mask = None
 
         swa_block_mask = None
         global_padded_mask = None
         swa_padded_mask = None
-        if attention_mask is None and self._has_swa_layers:
-            if self._needs_flex_swa_mask and _supports_cuda_flex_attention(device, seq_len):
-                swa_block_mask = _get_cached_swa_block_mask(
-                    seq_len=seq_len,
-                    window_size=self.config.sliding_window,
-                    sink_tokens=self.config.sink_tokens,
-                    device=device,
-                )
-            else:
-                swa_padded_mask = build_swa_sink_mask(
-                    seq_len=seq_len,
-                    window_size=self.config.sliding_window,
-                    sink_tokens=self.config.sink_tokens,
-                    device=device,
-                )
-        elif attention_mask is not None:
-            if self._has_global_layers:
-                global_padded_mask = build_padded_attn_mask(
-                    attention_mask, seq_len, is_global=True, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
-                )
-            if self._has_swa_layers:
-                swa_padded_mask = build_padded_attn_mask(
-                    attention_mask, seq_len, is_global=False, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
-                )
+        if past_key_values is None:
+            if attention_mask is None and self._has_swa_layers:
+                if self._needs_flex_swa_mask and _supports_cuda_flex_attention(device, seq_len):
+                    swa_block_mask = _get_cached_swa_block_mask(
+                        seq_len=seq_len,
+                        window_size=self.config.sliding_window,
+                        sink_tokens=self.config.sink_tokens,
+                        device=device,
+                    )
+                else:
+                    swa_padded_mask = build_swa_sink_mask(
+                        seq_len=seq_len,
+                        window_size=self.config.sliding_window,
+                        sink_tokens=self.config.sink_tokens,
+                        device=device,
+                    )
+            elif attention_mask is not None:
+                if self._has_global_layers:
+                    global_padded_mask = build_padded_attn_mask(
+                        attention_mask, seq_len, is_global=True, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
+                    )
+                if self._has_swa_layers:
+                    swa_padded_mask = build_padded_attn_mask(
+                        attention_mask, seq_len, is_global=False, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
+                    )
 
         x = self.tok_emb(input_ids)
-        rope_dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
-        cos, sin = self.rope(seq_len, dtype=rope_dtype)
+        cos, sin = self.rope(seq_len, dtype=torch.float32, offset=past_len)
 
+        compute_z_loss = self.config.router_z_loss_coef > 0.0
         entropies = []
-        for block in self.blocks:
+        z_losses = []
+        present_kvs: list[tuple[torch.Tensor, torch.Tensor]] | None = [] if use_cache else None
+        for idx, block in enumerate(self.blocks):
             layer_mask = global_padded_mask if block.attn.is_global else swa_padded_mask
-            x, rw = block(
+            layer_past = past_key_values[idx] if past_key_values is not None else None
+            x, rw, z_loss, present_kv = block(
                 x,
                 cos,
                 sin,
                 attention_mask=attention_mask,
                 swa_block_mask=swa_block_mask,
                 precomputed_mask=layer_mask,
+                is_right_padded=is_right_padded,
+                past_kv=layer_past,
+                use_cache=use_cache,
+                return_z_loss=compute_z_loss,
             )
+            if present_kvs is not None:
+                assert present_kv is not None
+                present_kvs.append(present_kv)
+            if z_loss is not None:
+                z_losses.append(z_loss)
             with torch.no_grad():
                 rw_f = rw.float().clamp(min=1e-8)
                 entropies.append(-(rw_f * rw_f.log()).sum(dim=-1).mean())
@@ -180,6 +222,8 @@ class CroutonForCausalLM(nn.Module):
             cap = self.config.logit_softcap
             logits_fp32 = cap * torch.tanh(logits.float() / cap)
             logits = logits_fp32.to(logits.dtype)
+
+        router_z_loss = torch.stack(z_losses).mean() if z_losses else None
 
         loss = None
         if targets is not None:
@@ -198,9 +242,17 @@ class CroutonForCausalLM(nn.Module):
                 tok_loss = F.cross_entropy(flat_logits.float(), safe_targets, reduction="none")
                 valid_f = valid_mask.float()
                 loss = (tok_loss * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+            if router_z_loss is not None:
+                loss = loss + self.config.router_z_loss_coef * router_z_loss
 
         router_entropy = torch.stack(entropies).mean() if entropies else None
-        return CroutonOutput(logits=logits, loss=loss, router_entropy=router_entropy)
+        return CroutonOutput(
+            logits=logits,
+            loss=loss,
+            router_entropy=router_entropy,
+            router_z_loss=router_z_loss,
+            past_key_values=present_kvs,
+        )
 
     @torch.no_grad()
     def generate(
@@ -237,10 +289,17 @@ class CroutonForCausalLM(nn.Module):
             eos_fill = eos_tensor[:1].view(1, 1) if eos_tensor is not None else None
             ids = input_ids
             finished = torch.zeros(ids.size(0), dtype=torch.bool, device=ids.device)
+            past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
             for _ in range(max(0, max_new_tokens)):
-                ctx_ids = ids[:, -self.config.max_seq_len :]
-                logits = self(ctx_ids).logits[:, -1, :].float()
+                if past_key_values is not None and ids.size(1) <= self.config.max_seq_len:
+                    out = self(ids[:, -1:], past_key_values=past_key_values, use_cache=True)
+                else:
+                    ctx_ids = ids[:, -self.config.max_seq_len :]
+                    want_cache = ids.size(1) < self.config.max_seq_len
+                    out = self(ctx_ids, use_cache=want_cache)
+                past_key_values = getattr(out, "past_key_values", None)
+                logits = out.logits[:, -1, :].float()
                 if vocab_limit is not None and 0 < vocab_limit < logits.size(-1):
                     logits = logits[:, :vocab_limit]
                 if temperature <= 0.0:

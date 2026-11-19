@@ -376,3 +376,82 @@ def test_model_config_validation_and_optional_flags(tmp_path):
     assert torch.allclose(comp_out.logits[:, :2], eager_out.logits[:, :2], atol=1e-5, rtol=1e-5)
     assert torch.allclose(comp_out.loss, eager_out.loss, atol=1e-5, rtol=1e-5)
     assert compiled_ce(ce_x, attention_mask=pad_mask, targets=all_masked).loss.item() == 0.0
+    comp_rp = compiled_ce(ce_x, attention_mask=pad_mask, targets=ce_tgt, is_right_padded=True)
+    assert torch.allclose(comp_rp.logits[:, :2], eager_out.logits[:, :2], atol=1e-5, rtol=1e-5)
+
+
+def test_kv_cache_gemm_moe_zloss_and_yarn_clamp():
+    cfg = CroutonConfig(
+        vocab_size=64,
+        d_model=32,
+        n_layers=3,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        n_experts=4,
+        expert_rank=4,
+        max_seq_len=12,
+        sliding_window=4,
+        sink_tokens=2,
+        global_layer_interval=2,
+        router_z_loss_coef=1e-2,
+        expert_b_init_std=1e-2,
+        use_flex_attention=False,
+    )
+    model = CroutonForCausalLM(cfg)
+    model.train()
+
+    # Non-zero expert_b_init_std + router_z_loss_coef gives step-0 router gradients and finite z-loss
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    out = model(x, targets=y)
+    assert out.router_z_loss is not None and torch.isfinite(out.router_z_loss)
+    out.loss.backward()
+    for block in model.blocks:
+        assert block.moe.router.weight.grad is not None
+        assert block.moe.router.weight.grad.abs().sum().item() > 0.0
+
+    # 2D GEMM MoE matches reference einsum exactly
+    moe = model.blocks[0].moe
+    moe.eval()
+    h = torch.randn(2, 6, 32)
+    with torch.no_grad():
+        gemm_out, weights = moe(h)
+        w = weights.to(h.dtype).unsqueeze(-1)
+        up_ref = moe.w_up(h) + moe.scale * torch.einsum(
+            "bter,erf->btf", torch.einsum("btd,edr->bter", h, moe.up_A) * w, moe.up_B
+        )
+        act_ref = torch.relu(up_ref).square()
+        ref_out = moe.w_down(act_ref) + moe.scale * torch.einsum(
+            "bter,erd->btd", torch.einsum("btf,efr->bter", act_ref, moe.down_A) * w, moe.down_B
+        )
+    assert torch.allclose(gemm_out, ref_out, atol=1e-5, rtol=1e-5)
+
+    # KV-cached forward & generate() match uncached full-context decoding (including across max_seq_len)
+    model.eval()
+    prompt = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    with torch.no_grad():
+        prefill = model(prompt, use_cache=True)
+        step1 = model(torch.tensor([[6]], dtype=torch.long), past_key_values=prefill.past_key_values, use_cache=True)
+        full_ref = model(torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long))
+    assert torch.allclose(step1.logits[:, -1], full_ref.logits[:, -1], atol=1e-5, rtol=1e-5)
+
+    # Generate past max_seq_len=12 (5 + 10 = 15 tokens) and verify exact parity with uncached greedy decode
+    cached_gen = model.generate(prompt, max_new_tokens=10, temperature=0.0)
+    uncached = prompt.clone()
+    with torch.no_grad():
+        for _ in range(10):
+            nxt = model(uncached[:, -cfg.max_seq_len :]).logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            uncached = torch.cat([uncached, nxt], dim=-1)
+    assert torch.equal(cached_gen, uncached)
+
+    # Extreme YaRN original_max_seq_len does not produce invalid negative (high - low)
+    rope_extreme = RotaryEmbedding(
+        head_dim=8,
+        max_seq_len=32,
+        theta=100.0,
+        scale_factor=2.0,
+        scaling_type="yarn",
+        original_max_seq_len=1_000_000,
+    )
+    assert torch.isfinite(rope_extreme.inv_freq).all()

@@ -79,6 +79,8 @@ class CroutonConfig:
     qk_norm: bool = True
     logit_softcap: float = 0.0
     router_jitter: float = 0.0
+    router_z_loss_coef: float = 0.0
+    expert_b_init_std: float = 0.0
     use_flex_attention: bool = True
 
     def __post_init__(self) -> None:
@@ -102,7 +104,16 @@ class CroutonConfig:
         )
         _require_num_fields(
             self,
-            ("expert_alpha", "rope_theta", "rope_scale_factor", "norm_eps", "logit_softcap", "router_jitter"),
+            (
+                "expert_alpha",
+                "rope_theta",
+                "rope_scale_factor",
+                "norm_eps",
+                "logit_softcap",
+                "router_jitter",
+                "router_z_loss_coef",
+                "expert_b_init_std",
+            ),
         )
         _require_bool_fields(self, ("tie_embeddings", "qk_norm", "use_flex_attention"))
         if not isinstance(self.rope_scaling_type, str):
@@ -136,9 +147,14 @@ class CroutonConfig:
             or not math.isfinite(self.router_jitter)
             or self.router_jitter < 0.0
             or self.router_jitter >= 1.0
+            or not math.isfinite(self.router_z_loss_coef)
+            or self.router_z_loss_coef < 0.0
+            or not math.isfinite(self.expert_b_init_std)
+            or self.expert_b_init_std < 0.0
         ):
             raise ValueError(
-                "norm_eps must be > 0, logit_softcap finite >= 0, and router_jitter finite in [0, 1)"
+                "norm_eps must be > 0, logit_softcap/router_z_loss_coef/expert_b_init_std finite >= 0, "
+                "and router_jitter finite in [0, 1)"
             )
         if self.max_seq_len < 1:
             raise ValueError(f"max_seq_len ({self.max_seq_len}) must be >= 1")

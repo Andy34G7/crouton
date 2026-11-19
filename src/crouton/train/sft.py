@@ -166,7 +166,7 @@ def run_sft(
             x, y, attn_mask = x.to(device), y.to(device), attn_mask.to(device)
             n_valid = int((y != -100).sum().item())
             with amp_ctx:
-                out = model(x, targets=y, attention_mask=attn_mask)
+                out = model(x, targets=y, attention_mask=attn_mask, is_right_padded=True)
                 sum_loss = out.loss * float(n_valid)
             sum_loss.backward()
             total_nll += float(sum_loss.item())

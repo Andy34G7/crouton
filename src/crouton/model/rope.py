@@ -53,7 +53,10 @@ class RotaryEmbedding(nn.Module):
             inv_freq_extrap = 1.0 / (theta ** (dim_range / head_dim))
             inv_freq_interp = inv_freq_extrap / scale_factor
             half_dim = head_dim // 2
-            low = max(0, math.floor(_yarn_find_correction_dim(beta_fast, head_dim, theta, original_max_seq_len)))
+            low = min(
+                half_dim - 1,
+                max(0, math.floor(_yarn_find_correction_dim(beta_fast, head_dim, theta, original_max_seq_len))),
+            )
             high = min(
                 half_dim - 1,
                 math.ceil(_yarn_find_correction_dim(beta_slow, head_dim, theta, original_max_seq_len)),
@@ -71,20 +74,25 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", sin_cached, persistent=False)
         self._max_seq_len_cached = max_seq_len
 
-    def _compute_tables(self, seq_len: int, inv_freq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        t = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
+    def _compute_tables(
+        self, seq_len: int, inv_freq: torch.Tensor, offset: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        t = torch.arange(offset, offset + seq_len, device=inv_freq.device, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos() * self.mscale, emb.sin() * self.mscale
 
-    def forward(self, seq_len: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        if seq_len <= self._max_seq_len_cached:
+    def forward(
+        self, seq_len: int, dtype: torch.dtype = torch.float32, offset: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        end = offset + seq_len
+        if end <= self._max_seq_len_cached:
             return (
-                self.cos_cached[:seq_len].to(dtype=dtype),
-                self.sin_cached[:seq_len].to(dtype=dtype),
+                self.cos_cached[offset:end].to(dtype=dtype),
+                self.sin_cached[offset:end].to(dtype=dtype),
             )
         # Compute functionally when exceeding static cache to avoid buffer mutation inside torch.compile.
-        cos_ext, sin_ext = self._compute_tables(seq_len, self.inv_freq)
+        cos_ext, sin_ext = self._compute_tables(seq_len, self.inv_freq, offset=offset)
         return cos_ext.to(dtype=dtype), sin_ext.to(dtype=dtype)
 
 
@@ -101,9 +109,11 @@ def apply_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary embeddings to q, k of shape [B, H, T, D]."""
-    cos_u = cos.to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
-    sin_u = sin.to(dtype=q.dtype).unsqueeze(0).unsqueeze(0)
-    q_rot = (q * cos_u) + (rotate_half(q) * sin_u)
-    k_rot = (k * cos_u) + (rotate_half(k) * sin_u)
+    """Apply rotary embeddings to q, k of shape [B, H, T, D] in fp32 for long-context precision."""
+    cos_u = cos.float().unsqueeze(0).unsqueeze(0)
+    sin_u = sin.float().unsqueeze(0).unsqueeze(0)
+    q_f = q.float()
+    k_f = k.float()
+    q_rot = ((q_f * cos_u) + (rotate_half(q_f) * sin_u)).to(dtype=q.dtype)
+    k_rot = ((k_f * cos_u) + (rotate_half(k_f) * sin_u)).to(dtype=k.dtype)
     return q_rot, k_rot

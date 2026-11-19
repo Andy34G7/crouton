@@ -246,14 +246,14 @@ def run_preference_tuning(
 
             if not use_orpo:
                 with torch.no_grad(), amp_ctx:
-                    ref_c = sequence_logps(ref_model(c_ids, attention_mask=c_mask).logits, c_lbl)
-                    ref_r = sequence_logps(ref_model(r_ids, attention_mask=r_mask).logits, r_lbl)
+                    ref_c = sequence_logps(ref_model(c_ids, attention_mask=c_mask, is_right_padded=True).logits, c_lbl)
+                    ref_r = sequence_logps(ref_model(r_ids, attention_mask=r_mask, is_right_padded=True).logits, r_lbl)
 
             with amp_ctx:
-                c_out = policy(c_ids, attention_mask=c_mask)
+                c_out = policy(c_ids, attention_mask=c_mask, is_right_padded=True)
                 p_c = sequence_logps(c_out.logits, c_lbl)
                 del c_out
-                r_out = policy(r_ids, attention_mask=r_mask)
+                r_out = policy(r_ids, attention_mask=r_mask, is_right_padded=True)
                 p_r = sequence_logps(r_out.logits, r_lbl)
                 del r_out
 

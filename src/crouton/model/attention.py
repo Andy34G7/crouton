@@ -167,7 +167,10 @@ class HybridSparseAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         swa_block_mask: object | None = None,
         precomputed_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        is_right_padded: bool = False,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         bsz, seq_len, _ = x.shape
 
         q = self.wq(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -181,10 +184,36 @@ class HybridSparseAttention(nn.Module):
 
         q, k = apply_rope(q, k, cos, sin)
 
-        if precomputed_mask is not None:
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        present_kv = (k, v) if use_cache else None
+
+        if past_kv is not None:
+            kv_len = k.size(2)
+            q_offset = kv_len - seq_len
+            if self.is_global:
+                if seq_len == 1:
+                    out = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=self.n_rep > 1)
+                else:
+                    q_pos = torch.arange(q_offset, kv_len, device=q.device)[:, None]
+                    kv_pos = torch.arange(kv_len, device=q.device)[None, :]
+                    causal_mask = (q_pos >= kv_pos).unsqueeze(0).unsqueeze(0)
+                    out = F.scaled_dot_product_attention(q, k, v, attn_mask=causal_mask, enable_gqa=self.n_rep > 1)
+            else:
+                q_pos = torch.arange(q_offset, kv_len, device=q.device)[:, None]
+                kv_pos = torch.arange(kv_len, device=q.device)[None, :]
+                swa_mask = (
+                    (q_pos >= kv_pos) & (((q_pos - kv_pos) < self.sliding_window) | (kv_pos < self.sink_tokens))
+                ).unsqueeze(0).unsqueeze(0)
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=swa_mask, enable_gqa=self.n_rep > 1)
+        elif precomputed_mask is not None:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=precomputed_mask, enable_gqa=self.n_rep > 1)
         else:
-            if attention_mask is not None and not torch.compiler.is_compiling() and _is_right_padded(attention_mask):
+            if attention_mask is not None and (
+                is_right_padded or (not torch.compiler.is_compiling() and _is_right_padded(attention_mask))
+            ):
                 attention_mask = None
 
             if attention_mask is not None:
@@ -205,4 +234,8 @@ class HybridSparseAttention(nn.Module):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=self.n_rep > 1)
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_heads * self.head_dim)
-        return self.wo(out)
+        proj = self.wo(out)
+        if use_cache:
+            assert present_kv is not None
+            return proj, present_kv
+        return proj
