@@ -531,16 +531,19 @@ def test_shard_writer_memmap_and_pretrain_resume(tmp_path):
         seq_len=8,
         micro_batch_size=2,
         grad_accum_steps=1,
-        total_steps=2,
+        total_steps=3,
         warmup_steps=1,
         decay_steps=1,
         eval_interval=1,
-        save_interval=0,
+        save_interval=2,
         bf16=False,
         compile_model=False,
     )
     run_pretrain(cfg, tcfg1, data_dir=str(data_dir))
+    assert (out1 / "step_2.pt").is_file()
     assert (out1 / "final.pt").is_file()
+    step_ckpt = torch.load(out1 / "step_2.pt", map_location="cpu", weights_only=False)
+    assert "muon_opt" in step_ckpt and "adamw_opt" in step_ckpt
 
     out2 = tmp_path / "run2"
     tcfg2 = TrainConfig(
@@ -549,7 +552,7 @@ def test_shard_writer_memmap_and_pretrain_resume(tmp_path):
         seq_len=8,
         micro_batch_size=2,
         grad_accum_steps=1,
-        total_steps=2,
+        total_steps=4,
         warmup_steps=0,
         decay_steps=1,
         eval_interval=0,
@@ -557,5 +560,14 @@ def test_shard_writer_memmap_and_pretrain_resume(tmp_path):
         bf16=False,
         compile_model=False,
     )
-    run_pretrain(cfg, tcfg2, data_dir=str(data_dir), resume_checkpoint=str(out1 / "final.pt"))
+    run_pretrain(cfg, tcfg2, data_dir=str(data_dir), resume_checkpoint=str(out1 / "step_2.pt"))
     assert (out2 / "final.pt").is_file()
+
+    # Verify crouton.chat.stream_generate parity with model.generate()
+    from crouton.chat import stream_generate
+
+    m_chat = CroutonForCausalLM(cfg).eval()
+    prompt = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    streamed = list(stream_generate(m_chat, prompt, max_new_tokens=6, temperature=0.0))
+    batch_gen = m_chat.generate(prompt, max_new_tokens=6, temperature=0.0)[0, 3:].tolist()
+    assert streamed == batch_gen

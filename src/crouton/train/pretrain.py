@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import os
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tokenisers import WpBpePpigTokenizer
 from torch.utils.data import DataLoader
 
@@ -67,6 +70,21 @@ def run_validation_memmap(
     return total_loss / max(1, eval_batches)
 
 
+def _init_distributed() -> tuple[bool, int, int, int]:
+    """Initialize DDP when launched via torchrun (WORLD_SIZE > 1); return (is_ddp, rank, local_rank, world_size)."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return False, 0, 0, 1
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return True, rank, local_rank, world_size
+
+
 def run_pretrain(
     model_cfg: CroutonConfig,
     train_cfg: TrainConfig,
@@ -84,121 +102,159 @@ def run_pretrain(
     if data_dir is not None and local_file is not None:
         raise ValueError("data_dir and local_file cannot be combined")
     validate_output_dir(train_cfg.output_dir)
-    torch.manual_seed(train_cfg.seed)
-    device = get_device()
-    use_bf16 = train_cfg.bf16 and bf16_supported(device)
-    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    local_texts = read_nonempty_lines(local_file, label="Local training file") if local_file is not None else None
-    val_texts = read_nonempty_lines(val_file, label="Validation file") if val_file is not None else None
+    is_ddp, rank, local_rank, _world_size = _init_distributed()
+    is_master = rank == 0
+    try:
+        torch.manual_seed(train_cfg.seed + rank)
+        device = torch.device(f"cuda:{local_rank}") if (is_ddp and torch.cuda.is_available()) else get_device()
+        use_bf16 = train_cfg.bf16 and bf16_supported(device)
+        amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
-    tokenizer = None
-    val_memmap_loader = None
-    if data_dir is not None:
-        dataset = ShardedMemmapDataset(
-            data_path=data_dir,
-            seq_len=train_cfg.seq_len,
-            split="train",
-            seed=train_cfg.seed,
-        )
-        data_root = Path(data_dir) if Path(data_dir).is_dir() else Path(data_dir).parent
-        if val_texts is None and (data_root / "val.bin").is_file():
-            val_ds = ShardedMemmapDataset(
-                data_path=data_root / "val.bin",
+        local_texts = read_nonempty_lines(local_file, label="Local training file") if local_file is not None else None
+        val_texts = read_nonempty_lines(val_file, label="Validation file") if val_file is not None else None
+
+        tokenizer = None
+        val_memmap_loader = None
+        if data_dir is not None:
+            dataset = ShardedMemmapDataset(
+                data_path=data_dir,
                 seq_len=train_cfg.seq_len,
-                split="val",
-                seed=train_cfg.seed + 1,
+                split="train",
+                seed=train_cfg.seed + rank * 100003,
             )
-            val_memmap_loader = DataLoader(val_ds, batch_size=train_cfg.micro_batch_size)
-        if val_texts is not None:
+            data_root = Path(data_dir) if Path(data_dir).is_dir() else Path(data_dir).parent
+            if is_master and val_texts is None and (data_root / "val.bin").is_file():
+                val_ds = ShardedMemmapDataset(
+                    data_path=data_root / "val.bin",
+                    seq_len=train_cfg.seq_len,
+                    split="val",
+                    seed=train_cfg.seed + 1,
+                )
+                val_memmap_loader = DataLoader(val_ds, batch_size=train_cfg.micro_batch_size)
+            if val_texts is not None:
+                tokenizer = WpBpePpigTokenizer.from_pretrained(train_cfg.tokenizer_path)
+                validate_tokenizer_vocab(tokenizer, model_cfg)
+        else:
             tokenizer = WpBpePpigTokenizer.from_pretrained(train_cfg.tokenizer_path)
             validate_tokenizer_vocab(tokenizer, model_cfg)
-    else:
-        tokenizer = WpBpePpigTokenizer.from_pretrained(train_cfg.tokenizer_path)
-        validate_tokenizer_vocab(tokenizer, model_cfg)
-        dataset = StreamingPackedDataset(
-            tokenizer=tokenizer,
-            seq_len=train_cfg.seq_len,
-            sources=[
-                ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
-                ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
-            ],
-            local_texts=local_texts,
-            shuffle_seed=train_cfg.seed,
-        )
-    dataloader = DataLoader(dataset, batch_size=train_cfg.micro_batch_size)
-    loader = iter(dataloader)
-
-    if resume_checkpoint is not None:
-        ckpt, ckpt_cfg, _ = load_checkpoint_payload(resume_checkpoint)
-        if ckpt_cfg.max_seq_len < model_cfg.max_seq_len:
-            ckpt_cfg.max_seq_len = model_cfg.max_seq_len
-        model_cfg = ckpt_cfg
-        raw_model = instantiate_checkpoint_model(ckpt, model_cfg, device)
-    else:
-        raw_model = CroutonForCausalLM(model_cfg).to(device)
-    muon_opt, adamw_opt = build_optimizers(
-        raw_model,
-        muon_lr=train_cfg.muon_lr,
-        adamw_lr=train_cfg.adamw_lr,
-        weight_decay=train_cfg.weight_decay,
-    )
-    model: torch.nn.Module = (
-        torch.compile(raw_model) if (train_cfg.compile_model and device.type == "cuda") else raw_model
-    )
-
-    model.train()
-    for step in range(train_cfg.total_steps):
-        mult = wsd_lr_multiplier(
-            step=step,
-            total_steps=train_cfg.total_steps,
-            warmup_steps=train_cfg.warmup_steps,
-            decay_steps=train_cfg.decay_steps,
-            min_lr_ratio=train_cfg.min_lr_ratio,
-        )
-        set_optimizer_lr(muon_opt, train_cfg.muon_lr, mult)
-        set_optimizer_lr(adamw_opt, train_cfg.adamw_lr, mult)
-
-        muon_opt.zero_grad(set_to_none=True)
-        adamw_opt.zero_grad(set_to_none=True)
-        total_loss = 0.0
-        total_entropy = 0.0
-
-        for _ in range(train_cfg.grad_accum_steps):
-            (x, y), loader = next_or_restart(loader, dataloader)
-            x, y = x.to(device), y.to(device)
-            with amp_ctx:
-                out = model(x, targets=y)
-                loss = out.loss / train_cfg.grad_accum_steps
-            loss.backward()
-            total_loss += float(loss.item())
-            if out.router_entropy is not None:
-                total_entropy += float(out.router_entropy.item()) / train_cfg.grad_accum_steps
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-        muon_opt.step()
-        adamw_opt.step()
-
-        if step % train_cfg.log_interval == 0:
-            print(
-                f"[pretrain step {step:6d}] loss={total_loss:.4f} "
-                f"router_ent={total_entropy:.3f} lr_mult={mult:.3f}"
+            dataset = StreamingPackedDataset(
+                tokenizer=tokenizer,
+                seq_len=train_cfg.seq_len,
+                sources=[
+                    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
+                    ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
+                ],
+                local_texts=local_texts,
+                shuffle_seed=train_cfg.seed + rank * 100003,
             )
+        dataloader = DataLoader(dataset, batch_size=train_cfg.micro_batch_size)
+        loader = iter(dataloader)
 
-        if train_cfg.eval_interval > 0 and step > 0 and step % train_cfg.eval_interval == 0:
-            if val_texts and tokenizer is not None:
-                val_loss, val_bpb = run_validation_bpb(
-                    model, tokenizer, val_texts, train_cfg.seq_len, device, amp_ctx
+        resume_ckpt: dict | None = None
+        start_step = 0
+        if resume_checkpoint is not None:
+            resume_ckpt, ckpt_cfg, ckpt_step = load_checkpoint_payload(resume_checkpoint)
+            if ckpt_cfg.max_seq_len < model_cfg.max_seq_len:
+                ckpt_cfg.max_seq_len = model_cfg.max_seq_len
+            model_cfg = ckpt_cfg
+            raw_model = instantiate_checkpoint_model(resume_ckpt, model_cfg, device)
+            if 0 < ckpt_step < train_cfg.total_steps:
+                start_step = ckpt_step
+        else:
+            raw_model = CroutonForCausalLM(model_cfg).to(device)
+
+        muon_opt, adamw_opt = build_optimizers(
+            raw_model,
+            muon_lr=train_cfg.muon_lr,
+            adamw_lr=train_cfg.adamw_lr,
+            weight_decay=train_cfg.weight_decay,
+        )
+        if resume_ckpt is not None:
+            if isinstance(resume_ckpt.get("muon_opt"), dict):
+                muon_opt.load_state_dict(resume_ckpt["muon_opt"])
+            if isinstance(resume_ckpt.get("adamw_opt"), dict):
+                adamw_opt.load_state_dict(resume_ckpt["adamw_opt"])
+            if is_master:
+                has_opt = "muon_opt" in resume_ckpt and "adamw_opt" in resume_ckpt
+                print(
+                    f"[pretrain resume] loaded {resume_checkpoint} (start_step={start_step}, optimizer_state={has_opt})"
                 )
-                print(f"[pretrain val step {step:6d}] val_loss={val_loss:.4f} val_bpb={val_bpb:.4f}")
-            elif val_memmap_loader is not None:
-                val_loss = run_validation_memmap(model, val_memmap_loader, device, amp_ctx)
-                print(f"[pretrain val step {step:6d}] val_loss={val_loss:.4f}")
 
-        if train_cfg.save_interval > 0 and step > 0 and step % train_cfg.save_interval == 0:
-            save_checkpoint(Path(train_cfg.output_dir) / f"step_{step}.pt", model, model_cfg, step)
+        model: torch.nn.Module = (
+            torch.compile(raw_model) if (train_cfg.compile_model and device.type == "cuda") else raw_model
+        )
+        if is_ddp:
+            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
 
-    save_checkpoint(Path(train_cfg.output_dir) / "final.pt", model, model_cfg, train_cfg.total_steps)
+        model.train()
+        for step in range(start_step, train_cfg.total_steps):
+            mult = wsd_lr_multiplier(
+                step=step,
+                total_steps=train_cfg.total_steps,
+                warmup_steps=train_cfg.warmup_steps,
+                decay_steps=train_cfg.decay_steps,
+                min_lr_ratio=train_cfg.min_lr_ratio,
+            )
+            set_optimizer_lr(muon_opt, train_cfg.muon_lr, mult)
+            set_optimizer_lr(adamw_opt, train_cfg.adamw_lr, mult)
+
+            muon_opt.zero_grad(set_to_none=True)
+            adamw_opt.zero_grad(set_to_none=True)
+            total_loss = 0.0
+            total_entropy = 0.0
+
+            for micro_idx in range(train_cfg.grad_accum_steps):
+                (x, y), loader = next_or_restart(loader, dataloader)
+                x, y = x.to(device), y.to(device)
+                sync_ctx = (
+                    model.no_sync()
+                    if (is_ddp and isinstance(model, DDP) and micro_idx < train_cfg.grad_accum_steps - 1)
+                    else nullcontext()
+                )
+                with sync_ctx:
+                    with amp_ctx:
+                        out = model(x, targets=y)
+                        loss = out.loss / train_cfg.grad_accum_steps
+                    loss.backward()
+                total_loss += float(loss.item())
+                if out.router_entropy is not None:
+                    total_entropy += float(out.router_entropy.item()) / train_cfg.grad_accum_steps
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+            muon_opt.step()
+            adamw_opt.step()
+
+            if is_master and step % train_cfg.log_interval == 0:
+                print(
+                    f"[pretrain step {step:6d}] loss={total_loss:.4f} "
+                    f"router_ent={total_entropy:.3f} lr_mult={mult:.3f}"
+                )
+
+            if is_master and train_cfg.eval_interval > 0 and step > 0 and step % train_cfg.eval_interval == 0:
+                if val_texts and tokenizer is not None:
+                    val_loss, val_bpb = run_validation_bpb(
+                        model, tokenizer, val_texts, train_cfg.seq_len, device, amp_ctx
+                    )
+                    print(f"[pretrain val step {step:6d}] val_loss={val_loss:.4f} val_bpb={val_bpb:.4f}")
+                elif val_memmap_loader is not None:
+                    val_loss = run_validation_memmap(model, val_memmap_loader, device, amp_ctx)
+                    print(f"[pretrain val step {step:6d}] val_loss={val_loss:.4f}")
+
+            if is_master and train_cfg.save_interval > 0 and step > 0 and step % train_cfg.save_interval == 0:
+                save_checkpoint(
+                    Path(train_cfg.output_dir) / f"step_{step}.pt",
+                    model,
+                    model_cfg,
+                    step,
+                    extra={"muon_opt": muon_opt.state_dict(), "adamw_opt": adamw_opt.state_dict()},
+                )
+
+        if is_master:
+            save_checkpoint(Path(train_cfg.output_dir) / "final.pt", model, model_cfg, train_cfg.total_steps)
+    finally:
+        if is_ddp and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def main() -> None:
