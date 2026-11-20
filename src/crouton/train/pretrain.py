@@ -208,7 +208,7 @@ def main() -> None:
         "--preset",
         type=str,
         default=None,
-        help="Optional size preset matching shortcake (tiny/5m, small/16m, base/50m, medium/110m, large/350m)",
+        help="Optional size preset (tiny/14m, small/30m, base/50m, medium/85m, large/300m)",
     )
     parser.add_argument("--tokenizer", type=str, default="artifacts/tokenizer/wp_bpe_ppig_32k.json")
     parser.add_argument("--output-dir", type=str, default="checkpoints/pretrain")

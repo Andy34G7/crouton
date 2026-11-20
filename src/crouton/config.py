@@ -23,21 +23,21 @@ REQUIRED_CONFIG_KEYS = (
 
 MODEL_PRESETS: dict[str, dict[str, Any]] = {
     "tiny": {
-        "d_model": 192,
-        "n_layers": 4,
-        "n_heads": 3,
-        "n_kv_heads": 1,
-        "d_ff": 512,
+        "d_model": 256,
+        "n_layers": 8,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "d_ff": 768,
         "n_experts": 4,
         "expert_rank": 16,
         "expert_alpha": 16.0,
     },
     "small": {
         "d_model": 384,
-        "n_layers": 8,
+        "n_layers": 10,
         "n_heads": 6,
         "n_kv_heads": 2,
-        "d_ff": 1024,
+        "d_ff": 1152,
         "n_experts": 4,
         "expert_rank": 16,
         "expert_alpha": 16.0,
@@ -53,11 +53,11 @@ MODEL_PRESETS: dict[str, dict[str, Any]] = {
         "expert_alpha": 24.0,
     },
     "medium": {
-        "d_model": 768,
-        "n_layers": 12,
-        "n_heads": 12,
-        "n_kv_heads": 4,
-        "d_ff": 2048,
+        "d_model": 640,
+        "n_layers": 16,
+        "n_heads": 10,
+        "n_kv_heads": 2,
+        "d_ff": 1792,
         "n_experts": 6,
         "expert_rank": 24,
         "expert_alpha": 24.0,
@@ -75,13 +75,14 @@ MODEL_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 _PRESET_ALIASES: dict[str, str] = {
-    "5": "tiny",
-    "16": "small",
-    "20": "small",
+    "14": "tiny",
+    "15": "tiny",
+    "28": "small",
+    "30": "small",
     "50": "base",
-    "110": "medium",
+    "85": "medium",
+    "90": "medium",
     "300": "large",
-    "350": "large",
 }
 
 

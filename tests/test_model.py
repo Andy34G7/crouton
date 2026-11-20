@@ -136,16 +136,16 @@ def test_yaml_configs_instantiate():
         assert cfg.is_global_layer(cfg.n_layers - 1)
 
     for alias, expected_d in (
-        ("tiny", 192),
-        ("5m", 192),
+        ("tiny", 256),
+        ("14m", 256),
         ("small", 384),
-        ("16m", 384),
+        ("30m", 384),
         ("crouton-base", 512),
         ("50m", 512),
-        ("medium", 768),
-        ("110m", 768),
+        ("medium", 640),
+        ("85m", 640),
         ("large", 1024),
-        ("350m", 1024),
+        ("300m", 1024),
     ):
         pcfg = CroutonConfig.from_preset(alias)
         assert pcfg.d_model == expected_d

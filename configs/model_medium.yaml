@@ -1,9 +1,9 @@
 vocab_size: 32768
-d_model: 768
-n_layers: 12
-n_heads: 12
-n_kv_heads: 4
-d_ff: 2048
+d_model: 640
+n_layers: 16
+n_heads: 10
+n_kv_heads: 2
+d_ff: 1792
 n_experts: 6
 expert_rank: 24
 expert_alpha: 24.0
