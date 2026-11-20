@@ -12,9 +12,14 @@ dependencies = [
     "torch>=2.5.0",
     "numpy>=1.26.0",
     "datasets>=2.18.0",
-    "tokenisers",
+    "tokenisers @ git+https://github.com/Andy34G7/lernea.git",
     "pyyaml>=6.0",
 ]
+
+[project.scripts]
+crouton-chat = "crouton.chat:main"
+crouton-prepare-data = "crouton.data.prepare_data:main"
+crouton-pretrain = "crouton.train.pretrain:main"
 
 [project.optional-dependencies]
 eval = [
@@ -25,7 +30,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-tokenisers = { path = "../tokenisers", editable = true }
+tokenisers = { git = "https://github.com/Andy34G7/lernea.git", branch = "main" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/crouton"]
