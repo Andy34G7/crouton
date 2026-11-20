@@ -123,10 +123,35 @@ def test_bf16_autocast_forward_backward():
 
 
 def test_yaml_configs_instantiate():
-    for name in ("configs/model_tiny.yaml", "configs/model_small.yaml", "configs/model_300m.yaml"):
+    for name in (
+        "configs/model_tiny.yaml",
+        "configs/model_small.yaml",
+        "configs/model_base.yaml",
+        "configs/model_medium.yaml",
+        "configs/model_large.yaml",
+        "configs/model_300m.yaml",
+    ):
         cfg = CroutonConfig.from_yaml(name)
         assert cfg.d_model % cfg.n_heads == 0
         assert cfg.is_global_layer(cfg.n_layers - 1)
+
+    for alias, expected_d in (
+        ("tiny", 192),
+        ("5m", 192),
+        ("small", 384),
+        ("16m", 384),
+        ("crouton-base", 512),
+        ("50m", 512),
+        ("medium", 768),
+        ("110m", 768),
+        ("large", 1024),
+        ("350m", 1024),
+    ):
+        pcfg = CroutonConfig.from_preset(alias)
+        assert pcfg.d_model == expected_d
+        assert pcfg.head_dim == 64
+    with pytest.raises(ValueError, match="Unknown model preset"):
+        CroutonConfig.from_preset("xxl")
 
 
 def test_model_config_validation_and_optional_flags(tmp_path):
@@ -455,3 +480,82 @@ def test_kv_cache_gemm_moe_zloss_and_yarn_clamp():
         original_max_seq_len=1_000_000,
     )
     assert torch.isfinite(rope_extreme.inv_freq).all()
+
+
+def test_shard_writer_memmap_and_pretrain_resume(tmp_path):
+    import numpy as np
+    from crouton.data import ShardedMemmapDataset, discover_bin_shards
+    from crouton.data.prepare_data import ShardWriter
+    from crouton.train.pretrain import run_pretrain
+
+    data_dir = tmp_path / "shards"
+    writer = ShardWriter(data_dir, prefix="train", shard_size=64)
+    tokens = np.arange(150, dtype=np.uint16) % 64
+    writer.add(tokens)
+    shards = writer.finalize()
+    assert shards == ["train_0000.bin", "train_0001.bin", "train_0002.bin"]
+    assert writer.total_tokens == 150
+
+    # Write a val.bin split too
+    (np.arange(40, dtype=np.uint16) % 64).tofile(data_dir / "val.bin")
+
+    # Auto-discover via directory path AND via shortcake-style data/train.bin path
+    assert len(discover_bin_shards(data_dir, split="train")) == 3
+    assert len(discover_bin_shards(data_dir / "train.bin", split="train")) == 3
+
+    ds = ShardedMemmapDataset(data_dir / "train.bin", seq_len=8, split="train", seed=7)
+    assert ds.total_tokens == 150
+    x, y = next(iter(ds))
+    assert x.shape == (8,) and y.shape == (8,) and x.dtype == torch.long
+
+    # Pretrain from uint16 shards + resume from saved checkpoint
+    cfg = CroutonConfig(
+        vocab_size=64,
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        n_experts=2,
+        expert_rank=4,
+        max_seq_len=8,
+        sliding_window=4,
+        sink_tokens=1,
+        global_layer_interval=2,
+        use_flex_attention=False,
+    )
+    out1 = tmp_path / "run1"
+    tcfg1 = TrainConfig(
+        output_dir=str(out1),
+        tokenizer_path="unused.json",
+        seq_len=8,
+        micro_batch_size=2,
+        grad_accum_steps=1,
+        total_steps=2,
+        warmup_steps=1,
+        decay_steps=1,
+        eval_interval=1,
+        save_interval=0,
+        bf16=False,
+        compile_model=False,
+    )
+    run_pretrain(cfg, tcfg1, data_dir=str(data_dir))
+    assert (out1 / "final.pt").is_file()
+
+    out2 = tmp_path / "run2"
+    tcfg2 = TrainConfig(
+        output_dir=str(out2),
+        tokenizer_path="unused.json",
+        seq_len=8,
+        micro_batch_size=2,
+        grad_accum_steps=1,
+        total_steps=2,
+        warmup_steps=0,
+        decay_steps=1,
+        eval_interval=0,
+        save_interval=0,
+        bf16=False,
+        compile_model=False,
+    )
+    run_pretrain(cfg, tcfg2, data_dir=str(data_dir), resume_checkpoint=str(out1 / "final.pt"))
+    assert (out2 / "final.pt").is_file()

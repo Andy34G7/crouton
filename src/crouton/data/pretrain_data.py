@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterator
 
+import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -181,3 +183,70 @@ class StreamingPackedDataset(IterableDataset):
             if pos >= max(chunk_size, len(buf) // 2):
                 buf = buf[pos:]
                 pos = 0
+
+
+def discover_bin_shards(data_path: str | Path, split: str = "train") -> list[Path]:
+    """Discover sharded uint16 `<split>_*.bin` files or a single `<split>.bin` file."""
+    p = Path(data_path)
+    if p.is_file():
+        return [p]
+    if p.is_dir():
+        shards = sorted(p.glob(f"{split}_*.bin"))
+        if shards:
+            return shards
+        single = p / f"{split}.bin"
+        if single.is_file():
+            return [single]
+        raise FileNotFoundError(f"No {split}_*.bin or {split}.bin files found in {p}")
+    # Backwards-compatible shortcake convention: data/train.bin auto-discovers data/train_*.bin
+    if p.suffix == ".bin" and p.parent.is_dir():
+        shards = sorted(p.parent.glob(f"{p.stem}_*.bin"))
+        if shards:
+            return shards
+    raise FileNotFoundError(f"Binary shard path not found: {p}")
+
+
+class ShardedMemmapDataset(IterableDataset):
+    """
+    Zero-copy multi-shard uint16 memmap dataset.
+    Samples contiguous (seq_len + 1) token windows uniformly across all shards
+    proportional to each shard's valid window count.
+    """
+
+    def __init__(
+        self,
+        data_path: str | Path,
+        seq_len: int,
+        split: str = "train",
+        seed: int = 42,
+    ) -> None:
+        super().__init__()
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
+            raise ValueError("seq_len must be >= 1")
+        self.seq_len = seq_len
+        self.seed = int(seed)
+        self.shard_paths = discover_bin_shards(data_path, split=split)
+        self._memmaps = [np.memmap(str(sp), dtype=np.uint16, mode="r") for sp in self.shard_paths]
+        self._max_starts = [len(mm) - (seq_len + 1) for mm in self._memmaps]
+        valid = [(mm, ms) for mm, ms in zip(self._memmaps, self._max_starts) if ms >= 0]
+        if not valid:
+            raise ValueError(
+                f"No shard in {data_path} has at least seq_len + 1 ({seq_len + 1}) tokens"
+            )
+        self._memmaps = [mm for mm, _ in valid]
+        self._window_counts = np.array([ms + 1 for _, ms in valid], dtype=np.float64)
+        self._probs = self._window_counts / self._window_counts.sum()
+        self.total_tokens = sum(len(mm) for mm in self._memmaps)
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        rng = np.random.default_rng(self.seed + worker_id * 10007)
+        chunk_size = self.seq_len + 1
+        n_shards = len(self._memmaps)
+        while True:
+            shard_idx = 0 if n_shards == 1 else int(rng.choice(n_shards, p=self._probs))
+            mm = self._memmaps[shard_idx]
+            start = int(rng.integers(0, len(mm) - chunk_size + 1))
+            chunk = torch.from_numpy(np.array(mm[start : start + chunk_size], dtype=np.int64))
+            yield chunk[:-1], chunk[1:]

@@ -21,6 +21,69 @@ REQUIRED_CONFIG_KEYS = (
     "max_seq_len",
 )
 
+MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "tiny": {
+        "d_model": 192,
+        "n_layers": 4,
+        "n_heads": 3,
+        "n_kv_heads": 1,
+        "d_ff": 512,
+        "n_experts": 4,
+        "expert_rank": 16,
+        "expert_alpha": 16.0,
+    },
+    "small": {
+        "d_model": 384,
+        "n_layers": 8,
+        "n_heads": 6,
+        "n_kv_heads": 2,
+        "d_ff": 1024,
+        "n_experts": 4,
+        "expert_rank": 16,
+        "expert_alpha": 16.0,
+    },
+    "base": {
+        "d_model": 512,
+        "n_layers": 12,
+        "n_heads": 8,
+        "n_kv_heads": 2,
+        "d_ff": 1536,
+        "n_experts": 6,
+        "expert_rank": 24,
+        "expert_alpha": 24.0,
+    },
+    "medium": {
+        "d_model": 768,
+        "n_layers": 12,
+        "n_heads": 12,
+        "n_kv_heads": 4,
+        "d_ff": 2048,
+        "n_experts": 6,
+        "expert_rank": 24,
+        "expert_alpha": 24.0,
+    },
+    "large": {
+        "d_model": 1024,
+        "n_layers": 24,
+        "n_heads": 16,
+        "n_kv_heads": 4,
+        "d_ff": 3072,
+        "n_experts": 8,
+        "expert_rank": 32,
+        "expert_alpha": 32.0,
+    },
+}
+
+_PRESET_ALIASES: dict[str, str] = {
+    "5": "tiny",
+    "16": "small",
+    "20": "small",
+    "50": "base",
+    "110": "medium",
+    "300": "large",
+    "350": "large",
+}
+
 
 def _require_int_fields(obj: Any, names: tuple[str, ...]) -> None:
     for name in names:
@@ -212,6 +275,27 @@ class CroutonConfig:
             return cls(**cfg_data)
         except TypeError as exc:
             raise ValueError(f"Invalid CroutonConfig fields in {path}: {exc}") from exc
+
+    @classmethod
+    def from_preset(cls, name: str, **kwargs: Any) -> CroutonConfig:
+        """Construct a CroutonConfig matching shortcake size classes: tiny, small, base, medium, large."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Preset name must be a non-empty string")
+        clean = name.lower().strip()
+        for prefix in ("crouton-", "shortcake-"):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix) :]
+        if clean.endswith("m") and clean[:-1].isdigit():
+            clean = clean[:-1]
+        preset_key = _PRESET_ALIASES.get(clean, clean)
+        if preset_key not in MODEL_PRESETS:
+            valid = list(MODEL_PRESETS) + [f"{k}m" for k in _PRESET_ALIASES]
+            raise ValueError(f"Unknown model preset {name!r}. Choose from: {valid}")
+        cfg_data = dict(MODEL_PRESETS[preset_key])
+        cfg_data.update(kwargs)
+        if "max_seq_len" in cfg_data and "rope_original_max_seq_len" not in cfg_data:
+            cfg_data["rope_original_max_seq_len"] = cfg_data["max_seq_len"]
+        return cls(**cfg_data)
 
 
 @dataclass
