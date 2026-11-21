@@ -225,7 +225,7 @@ def run_splade_train(
     lambda_q: float = 0.05,
     lambda_d: float = 0.04,
     reg_warmup_steps: int = 1500,
-    query_reg_type: str = "l1",
+    query_reg_type: str = "flops",
     margin_mse_weight: float = 0.5,
     temperature: float = 1.0,
     bidirectional: bool = True,
@@ -349,7 +349,7 @@ def main() -> None:
     parser.add_argument("--dataset", type=str, default="sentence-transformers/msmarco-bm25")
     parser.add_argument("--subset", type=str, default="triplet")
     parser.add_argument("--max-examples", type=int, default=100000)
-    parser.add_argument("--mntp-steps", type=int, default=300, help="Bidirectional MNTP warmup steps")
+    parser.add_argument("--mntp-steps", type=int, default=1000, help="Bidirectional MNTP warmup steps")
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--grad-accum", type=int, default=2)
@@ -359,7 +359,7 @@ def main() -> None:
     parser.add_argument("--lambda-q", type=float, default=0.05)
     parser.add_argument("--lambda-d", type=float, default=0.04)
     parser.add_argument("--reg-warmup-steps", type=int, default=1500)
-    parser.add_argument("--query-reg-type", type=str, default="l1", choices=["l1", "flops"])
+    parser.add_argument("--query-reg-type", type=str, default="flops", choices=["l1", "flops"])
     parser.add_argument("--margin-mse-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--causal", action="store_true", help="Keep causal attention instead of bidirectional")
