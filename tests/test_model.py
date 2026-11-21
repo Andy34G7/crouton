@@ -571,3 +571,95 @@ def test_shard_writer_memmap_and_pretrain_resume(tmp_path):
     streamed = list(stream_generate(m_chat, prompt, max_new_tokens=6, temperature=0.0))
     batch_gen = m_chat.generate(prompt, max_new_tokens=6, temperature=0.0)[0, 3:].tolist()
     assert streamed == batch_gen
+
+
+def test_bidirectional_splade_head_losses_and_train_smoke(tmp_path):
+    from crouton.model import (
+        CroutonSPLADE,
+        quad_reg_weight,
+        splade_infonce_loss,
+        splade_margin_mse_loss,
+    )
+    from crouton.train.common import save_checkpoint
+    from crouton.train.splade import run_splade_train
+
+    # Bidirectional SWA + sink mask is symmetric within window and allows future tokens
+    bi_mask = build_swa_sink_mask(seq_len=12, window_size=4, sink_tokens=2, device=torch.device("cpu"), is_causal=False)
+    bm = bi_mask[0, 0]
+    assert bm[0, 2] and bm[2, 0]  # future token within window visible
+    assert bm[10, 0] and bm[10, 1]  # sink tokens visible
+    assert not bm[10, 4]  # outside window and not sink
+
+    cfg = CroutonConfig(
+        vocab_size=32768,
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        n_experts=2,
+        expert_rank=4,
+        max_seq_len=32,
+        sliding_window=8,
+        sink_tokens=2,
+        global_layer_interval=2,
+        use_flex_attention=False,
+    )
+    backbone = CroutonForCausalLM(cfg)
+    splade = CroutonSPLADE(backbone, tie_lm_head=True, pad_token_id=0, bidirectional=True)
+    assert splade.splade_head.decoder.weight is backbone.tok_emb.weight
+
+    # Pad isolation under bidirectional attention: trailing pad token values must not change sparse_vector
+    splade.eval()
+    a = torch.tensor([[5, 9, 12, 0, 0]], dtype=torch.long)
+    b = torch.tensor([[5, 9, 12, 77, 99]], dtype=torch.long)
+    m = torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.bool)
+    with torch.no_grad():
+        out_a = splade(a, attention_mask=m)
+        out_b = splade(b, attention_mask=m)
+    assert (out_a.sparse_vector >= 0.0).all()
+    assert torch.allclose(out_a.sparse_vector, out_b.sparse_vector, atol=1e-5, rtol=1e-5)
+
+    # Losses & quadratic warmup
+    assert quad_reg_weight(0, 100, 0.05) == 0.0
+    assert abs(quad_reg_weight(50, 100, 0.04) - 0.01) < 1e-9
+    assert abs(quad_reg_weight(100, 100, 0.04) - 0.04) < 1e-9
+
+    splade.train()
+    q_o = splade(torch.tensor([[5, 9, 0], [6, 10, 11]]), attention_mask=torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool))
+    p_o = splade(torch.tensor([[5, 12, 13], [6, 14, 0]]), attention_mask=torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool))
+    n_o = splade(torch.tensor([[20, 21, 0], [22, 23, 24]]), attention_mask=torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool))
+    loss = splade_infonce_loss(q_o.sparse_vector, p_o.sparse_vector, n_o.sparse_vector) + 0.5 * splade_margin_mse_loss(
+        q_o.sparse_vector,
+        p_o.sparse_vector,
+        n_o.sparse_vector,
+        torch.tensor([3.0, 2.5]),
+        torch.tensor([0.5, 0.2]),
+    )
+    loss = loss + 0.01 * q_o.l1_loss + 0.01 * p_o.flops_loss
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert splade.splade_head.proj.weight.grad is not None
+
+    # End-to-end run_splade_train smoke test (MNTP + SPLADE + save)
+    ckpt_path = tmp_path / "base.pt"
+    save_checkpoint(ckpt_path, backbone, cfg, step=10)
+    out_dir = tmp_path / "splade_out"
+    records = [
+        {"query": "what is python", "pos": "python is a programming language", "neg": "bananas are yellow", "pos_score": 4.0, "neg_score": 0.1},
+        {"query": "binary search tree", "pos": "a binary search tree stores sorted keys", "neg": "weather forecast rain", "pos_score": 3.5, "neg_score": 0.2},
+    ]
+    final_pt = run_splade_train(
+        base_checkpoint=str(ckpt_path),
+        tokenizer_path="artifacts/tokenizer/wp_bpe_ppig_32k.json",
+        output_dir=str(out_dir),
+        records=records,
+        mntp_steps=1,
+        total_steps=2,
+        batch_size=2,
+        grad_accum_steps=1,
+        max_query_len=16,
+        max_doc_len=24,
+        bf16=False,
+    )
+    assert final_pt.is_file()

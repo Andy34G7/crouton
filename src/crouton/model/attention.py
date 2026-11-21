@@ -43,14 +43,19 @@ def build_swa_sink_mask(
     window_size: int,
     sink_tokens: int,
     device: torch.device,
+    is_causal: bool = True,
 ) -> torch.Tensor:
-    """Boolean attention mask [1, 1, T, T]: causal AND (within window OR sink token)."""
+    """Boolean attention mask [1, 1, T, T]: (causal if is_causal) AND (within window OR sink token)."""
     q_idx = torch.arange(seq_len, device=device)[:, None]
     kv_idx = torch.arange(seq_len, device=device)[None, :]
-    causal = q_idx >= kv_idx
-    in_window = (q_idx - kv_idx) < window_size
-    is_sink = kv_idx < sink_tokens
-    mask = causal & (in_window | is_sink)
+    if is_causal:
+        in_window = (q_idx >= kv_idx) & ((q_idx - kv_idx) < window_size)
+        is_sink = (q_idx >= kv_idx) & (kv_idx < sink_tokens)
+        mask = in_window | is_sink
+    else:
+        in_window = (q_idx - kv_idx).abs() < window_size
+        is_sink = kv_idx < sink_tokens
+        mask = in_window | is_sink
     return mask.unsqueeze(0).unsqueeze(0)
 
 
@@ -68,14 +73,20 @@ def build_padded_attn_mask(
     is_global: bool,
     sliding_window: int,
     sink_tokens: int,
+    is_causal: bool = True,
 ) -> torch.Tensor:
-    """Build [B, 1, T, T] boolean causal/SWA mask without NaN rows."""
+    """Build [B, 1, T, T] boolean causal/bidirectional SWA/global mask without NaN rows."""
     key_keep = attention_mask[:, None, None, :].bool()
     if is_global:
-        base_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=attention_mask.device))
+        if is_causal:
+            base_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=attention_mask.device))
+        else:
+            base_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=attention_mask.device)
         base_mask = base_mask.unsqueeze(0).unsqueeze(0)
     else:
-        base_mask = build_swa_sink_mask(seq_len, sliding_window, sink_tokens, attention_mask.device)
+        base_mask = build_swa_sink_mask(
+            seq_len, sliding_window, sink_tokens, attention_mask.device, is_causal=is_causal
+        )
     eye = torch.eye(seq_len, dtype=torch.bool, device=attention_mask.device).unsqueeze(0).unsqueeze(0)
     return (base_mask & key_keep) | eye
 
@@ -170,6 +181,7 @@ class HybridSparseAttention(nn.Module):
         is_right_padded: bool = False,
         past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
+        is_causal: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         bsz, seq_len, _ = x.shape
 
@@ -211,7 +223,7 @@ class HybridSparseAttention(nn.Module):
         elif precomputed_mask is not None:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=precomputed_mask, enable_gqa=self.n_rep > 1)
         else:
-            if attention_mask is not None and (
+            if is_causal and attention_mask is not None and (
                 is_right_padded or (not torch.compiler.is_compiling() and _is_right_padded(attention_mask))
             ):
                 attention_mask = None
@@ -223,14 +235,17 @@ class HybridSparseAttention(nn.Module):
                     is_global=self.is_global,
                     sliding_window=self.sliding_window,
                     sink_tokens=self.sink_tokens,
+                    is_causal=is_causal,
                 )
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=full_mask, enable_gqa=self.n_rep > 1)
             elif self.is_global:
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.n_rep > 1)
-            elif self.use_flex and _supports_cuda_flex_attention(q.device, seq_len):
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, enable_gqa=self.n_rep > 1)
+            elif is_causal and self.use_flex and _supports_cuda_flex_attention(q.device, seq_len):
                 out = self._flex_swa_attention(q, k, v, block_mask=swa_block_mask)
             else:
-                attn_mask = build_swa_sink_mask(seq_len, self.sliding_window, self.sink_tokens, q.device)
+                attn_mask = build_swa_sink_mask(
+                    seq_len, self.sliding_window, self.sink_tokens, q.device, is_causal=is_causal
+                )
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=self.n_rep > 1)
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_heads * self.head_dim)

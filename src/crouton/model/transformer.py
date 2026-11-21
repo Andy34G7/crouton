@@ -26,11 +26,12 @@ from crouton.model.rope import RotaryEmbedding
 
 @dataclass
 class CroutonOutput:
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     loss: torch.Tensor | None = None
     router_entropy: torch.Tensor | None = None
     router_z_loss: torch.Tensor | None = None
     past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    hidden_states: torch.Tensor | None = None
 
 
 class CroutonBlock(nn.Module):
@@ -55,6 +56,7 @@ class CroutonBlock(nn.Module):
         past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
         return_z_loss: bool = False,
+        is_causal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
         attn_res = self.attn(
             self.attn_norm(x),
@@ -66,6 +68,7 @@ class CroutonBlock(nn.Module):
             is_right_padded=is_right_padded,
             past_kv=past_kv,
             use_cache=use_cache,
+            is_causal=is_causal,
         )
         if use_cache:
             attn_out, present_kv = attn_res  # type: ignore[misc]
@@ -137,6 +140,9 @@ class CroutonForCausalLM(nn.Module):
         is_right_padded: bool = False,
         past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         use_cache: bool = False,
+        is_causal: bool = True,
+        return_hidden_states: bool = False,
+        skip_lm_head: bool = False,
     ) -> CroutonOutput:
         _, seq_len = input_ids.shape
         device = input_ids.device
@@ -146,7 +152,8 @@ class CroutonForCausalLM(nn.Module):
         # before entering embedding/RoPE/transformer tensor ops so compiled graphs stay contiguous.
         # Under strictly causal attention with right-padding, valid queries (q < valid_len) never
         # attend to trailing pad keys (kv >= valid_len), avoiding O(T^2) 4D mask materialization.
-        if attention_mask is not None and (
+        # Under bidirectional attention (is_causal=False), pad keys MUST remain masked.
+        if is_causal and attention_mask is not None and (
             is_right_padded or (not torch.compiler.is_compiling() and _is_right_padded(attention_mask))
         ):
             attention_mask = None
@@ -156,7 +163,7 @@ class CroutonForCausalLM(nn.Module):
         swa_padded_mask = None
         if past_key_values is None:
             if attention_mask is None and self._has_swa_layers:
-                if self._needs_flex_swa_mask and _supports_cuda_flex_attention(device, seq_len):
+                if is_causal and self._needs_flex_swa_mask and _supports_cuda_flex_attention(device, seq_len):
                     swa_block_mask = _get_cached_swa_block_mask(
                         seq_len=seq_len,
                         window_size=self.config.sliding_window,
@@ -169,15 +176,26 @@ class CroutonForCausalLM(nn.Module):
                         window_size=self.config.sliding_window,
                         sink_tokens=self.config.sink_tokens,
                         device=device,
+                        is_causal=is_causal,
                     )
             elif attention_mask is not None:
                 if self._has_global_layers:
                     global_padded_mask = build_padded_attn_mask(
-                        attention_mask, seq_len, is_global=True, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
+                        attention_mask,
+                        seq_len,
+                        is_global=True,
+                        sliding_window=self.config.sliding_window,
+                        sink_tokens=self.config.sink_tokens,
+                        is_causal=is_causal,
                     )
                 if self._has_swa_layers:
                     swa_padded_mask = build_padded_attn_mask(
-                        attention_mask, seq_len, is_global=False, sliding_window=self.config.sliding_window, sink_tokens=self.config.sink_tokens
+                        attention_mask,
+                        seq_len,
+                        is_global=False,
+                        sliding_window=self.config.sliding_window,
+                        sink_tokens=self.config.sink_tokens,
+                        is_causal=is_causal,
                     )
 
         x = self.tok_emb(input_ids)
@@ -201,6 +219,7 @@ class CroutonForCausalLM(nn.Module):
                 past_kv=layer_past,
                 use_cache=use_cache,
                 return_z_loss=compute_z_loss,
+                is_causal=is_causal,
             )
             if present_kvs is not None:
                 assert present_kv is not None
@@ -212,6 +231,19 @@ class CroutonForCausalLM(nn.Module):
                 entropies.append(-(rw_f * rw_f.log()).sum(dim=-1).mean())
 
         x = self.final_norm(x)
+        router_z_loss = torch.stack(z_losses).mean() if z_losses else None
+        router_entropy = torch.stack(entropies).mean() if entropies else None
+
+        if skip_lm_head and targets is None:
+            return CroutonOutput(
+                logits=None,
+                loss=None,
+                router_entropy=router_entropy,
+                router_z_loss=router_z_loss,
+                past_key_values=present_kvs,
+                hidden_states=x,
+            )
+
         if self.lm_head is None:
             logits = F.linear(x, self.tok_emb.weight)
         else:
@@ -222,8 +254,6 @@ class CroutonForCausalLM(nn.Module):
             cap = self.config.logit_softcap
             logits_fp32 = cap * torch.tanh(logits.float() / cap)
             logits = logits_fp32.to(logits.dtype)
-
-        router_z_loss = torch.stack(z_losses).mean() if z_losses else None
 
         loss = None
         if targets is not None:
@@ -245,13 +275,13 @@ class CroutonForCausalLM(nn.Module):
             if router_z_loss is not None:
                 loss = loss + self.config.router_z_loss_coef * router_z_loss
 
-        router_entropy = torch.stack(entropies).mean() if entropies else None
         return CroutonOutput(
             logits=logits,
             loss=loss,
             router_entropy=router_entropy,
             router_z_loss=router_z_loss,
             past_key_values=present_kvs,
+            hidden_states=x if return_hidden_states else None,
         )
 
     @torch.no_grad()
