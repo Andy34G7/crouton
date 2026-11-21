@@ -20,31 +20,44 @@ from crouton.train.common import (
 
 
 DEFAULT_TOKENIZER_SOURCES = [
-    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
-    ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "train", "text"),
+    ("HuggingFaceTB/SmolLM-Corpus", "fineweb-edu-dedup", "train", "text"),
+    ("HuggingFaceTB/SmolLM-Corpus", "cosmopedia-v2", "train", "text"),
+    ("HuggingFaceTB/SmolLM-Corpus", "python-edu", "train", "content"),
+    ("codeparrot/codeparrot-clean", None, "train", "content"),
 ]
+DEFAULT_TOKENIZER_WEIGHTS = [0.40, 0.30, 0.20, 0.10]
 MIN_VOCAB_SIZE = 256 + sum(len(t.encode("utf-8")) > 1 for t in DEFAULT_SPECIAL_TOKENS)
 
 
 def iter_hf_corpus(
     sources: list[tuple[str, str | None, str, str]],
     max_docs: int,
+    weights: list[float] | None = None,
 ) -> list[str]:
     validated_sources = validate_hf_sources(sources)
     if not validated_sources:
         raise ValueError("sources must be non-empty")
     if not isinstance(max_docs, int) or isinstance(max_docs, bool) or max_docs < 1:
         raise ValueError(f"max_docs ({max_docs}) must be >= 1")
+    if weights is not None and len(weights) != len(validated_sources):
+        raise ValueError("weights must match length of sources")
     from datasets import load_dataset
 
     iters = [iter(load_dataset(name, subset, split=split, streaming=True)) for name, subset, split, _ in validated_sources]
     fields = [field for _, _, _, field in validated_sources]
 
+    # Build deterministic weighted schedule (e.g. [0.4, 0.3, 0.2, 0.1] -> 4,3,2,1 per 10-doc cycle)
+    if weights is not None:
+        scaled = [max(1, round(w * 10)) for w in weights]
+        schedule = [i for i, count in enumerate(scaled) for _ in range(count)]
+    else:
+        schedule = list(range(len(iters)))
+
     texts: list[str] = []
     idx = 0
     exhausted = set()
     while len(texts) < max_docs and len(exhausted) < len(iters):
-        stream_i = idx % len(iters)
+        stream_i = schedule[idx % len(schedule)]
         idx += 1
         if stream_i in exhausted:
             continue
@@ -194,7 +207,11 @@ def main() -> None:
             max_docs=args.max_docs,
         )
     else:
-        corpus = iter_hf_corpus(sources=DEFAULT_TOKENIZER_SOURCES, max_docs=args.max_docs)
+        corpus = iter_hf_corpus(
+            sources=DEFAULT_TOKENIZER_SOURCES,
+            max_docs=args.max_docs,
+            weights=DEFAULT_TOKENIZER_WEIGHTS,
+        )
 
     tok = train_crouton_tokenizer(
         corpus=corpus,
