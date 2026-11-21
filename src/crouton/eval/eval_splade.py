@@ -137,6 +137,7 @@ def evaluate_beir_dataset(
     dataset_name: str = "scifact",
     max_queries: int = 300,
     max_docs: int = 5000,
+    encode_fn=None,
 ) -> dict[str, Any]:
     """Evaluate on a BEIR benchmark (e.g., scifact, nfcorpus, fiqa) via HuggingFace `BeIR/<dataset>`."""
     from datasets import load_dataset
@@ -180,17 +181,33 @@ def evaluate_beir_dataset(
     queries = [q_id_to_text[qid] for qid in active_qids]
     rel_indices = [{did_to_idx[d] for d in qrels_map[qid] if d in did_to_idx} for qid in active_qids]
 
-    q_vecs = encode_texts_splade(model, tokenizer, queries, device=device, max_len=64)
-    d_vecs = encode_texts_splade(model, tokenizer, doc_texts, device=device, max_len=256)
+    encode_fn = encode_fn or encode_texts_splade
+    q_vecs = encode_fn(model, tokenizer, queries, device=device, max_len=64)
+    d_vecs = encode_fn(model, tokenizer, doc_texts, device=device, max_len=256)
     metrics = compute_ranking_metrics(q_vecs, d_vecs, rel_indices)
     metrics["n_queries"] = float(len(queries))
     metrics["n_docs"] = float(len(doc_texts))
     return metrics
 
 
+@torch.no_grad()
+def encode_texts_hf_splade(model, tokenizer, texts: list[str], device: torch.device, max_len: int = 256, batch_size: int = 32) -> torch.Tensor:
+    """Reference SPLADE encoder for HF MLM checkpoints (naver/splade-v3 etc.): max-pool log1p(ReLU(logits))."""
+    if device.type != "cuda":
+        batch_size = min(batch_size, 8)  # (B, T, 30522) fp32 logits exceed a few GB on CPU otherwise
+    vecs: list[torch.Tensor] = []
+    for start in range(0, len(texts), batch_size):
+        enc = tokenizer(texts[start : start + batch_size], max_length=max_len, truncation=True, padding=True, return_tensors="pt").to(device)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            logits = model(**enc).logits
+        vecs.append((torch.log1p(torch.relu(logits.float())) * enc["attention_mask"].unsqueeze(-1)).amax(dim=1))
+    return torch.cat(vecs)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate CroutonSPLADE sparse retrieval.")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--hf-baseline", type=str, default=None, help="Score an HF SPLADE model (e.g. naver/splade-v3) on the same pool instead")
     parser.add_argument("--tokenizer", type=str, default="artifacts/tokenizer/wp_bpe_ppig_32k.json")
     parser.add_argument("--beir-task", type=str, default="scifact", help="BEIR dataset name (e.g., scifact, nfcorpus, fiqa)")
     parser.add_argument("--max-queries", type=int, default=300)
@@ -198,6 +215,21 @@ def main() -> None:
     args = parser.parse_args()
 
     device = get_device()
+    if args.hf_baseline:
+        from transformers import AutoModelForMaskedLM, AutoTokenizer
+
+        hf_tok = AutoTokenizer.from_pretrained(args.hf_baseline)
+        hf_model = AutoModelForMaskedLM.from_pretrained(args.hf_baseline).to(device).eval()
+        metrics = evaluate_beir_dataset(
+            hf_model, hf_tok, device=device, dataset_name=args.beir_task,
+            max_queries=args.max_queries, max_docs=args.max_docs, encode_fn=encode_texts_hf_splade,
+        )
+        print(f"\n=== {args.hf_baseline} BEIR {args.beir_task} ({int(metrics['n_queries'])} queries, {int(metrics['n_docs'])} docs) ===")
+        for k in ("ndcg@10", "mrr@10", "recall@10", "recall@100", "l0_q", "l0_d"):
+            print(f"  {k:12s}: {metrics[k]:.4f}")
+        return
+    if not args.checkpoint:
+        parser.error("--checkpoint is required unless --hf-baseline is given")
     tokenizer = WpBpePpigTokenizer.from_pretrained(args.tokenizer)
     model, _ = load_splade_model(args.checkpoint, device=device)
 

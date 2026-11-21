@@ -114,6 +114,10 @@ python -m crouton.eval.eval_runner \
 # python -m crouton.eval.eval_runner --checkpoint checkpoints/dpo/final.pt --val-file val.txt
 ```
 
+## SPLADE Backbone Adaptation (Experimental)
+
+`src/crouton/model/splade.py`, `src/crouton/train/splade.py`, and `src/crouton/eval/eval_splade.py` contain a small experimental test exploring how `crouton` adapts when used as a SPLADE sparse-retrieval backbone (switching to bidirectional attention with a short MNTP warmup and a tied SPLADE vocabulary head, plus a `--hf-baseline` flag for quick side-by-side BEIR checks). Full document retrieval benchmarks and broader SPLADE comparisons are intended to live in a separate repository.
+
 ## Verification & Testing
 
 Run the unit and end-to-end smoke test suite (covering SWA+sink masks, YaRN/NTK RoPE, `attention_mask`, `generate()`, `Muon`+`AdamW`+`WSD`, `_orig_mod.` checkpoint loading, `wp-bpe-ppig` pretokenization, and all training/eval stages):
