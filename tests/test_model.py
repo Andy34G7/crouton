@@ -663,3 +663,14 @@ def test_bidirectional_splade_head_losses_and_train_smoke(tmp_path):
         bf16=False,
     )
     assert final_pt.is_file()
+
+    from crouton.eval.eval_splade import compute_ranking_metrics, encode_texts_splade, load_splade_model, top_expanded_terms
+    from tokenisers import WpBpePpigTokenizer
+
+    loaded_splade, _ = load_splade_model(final_pt, device=torch.device("cpu"))
+    tok = WpBpePpigTokenizer.from_pretrained("artifacts/tokenizer/wp_bpe_ppig_32k.json")
+    qv = encode_texts_splade(loaded_splade, tok, ["what is python", "binary search tree"], device=torch.device("cpu"), max_len=16)
+    dv = encode_texts_splade(loaded_splade, tok, ["python is a programming language", "a binary search tree stores sorted keys"], device=torch.device("cpu"), max_len=24)
+    metrics = compute_ranking_metrics(qv, dv, [{0}, {1}])
+    assert 0.0 <= metrics["ndcg@10"] <= 1.0 and 0.0 <= metrics["mrr@10"] <= 1.0
+    assert isinstance(top_expanded_terms(qv[0], tok, top_k=5), list)
