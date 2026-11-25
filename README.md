@@ -42,7 +42,7 @@ pip install -e ../tokenisers -e ".[dev,eval]"
 
 - **Algorithm**: `WpBpePpigTokenizer` (`wp-bpe-ppig`) from the sibling [`../tokenisers`](../tokenisers) repo (`vocab_size=32768`, `length_penalty=0.35`, `min_frequency=2`), registering 4 special tokens: `<|endoftext|>`, `<|im_start|>`, `<|im_end|>`, and `<|pad|>`.
 - **Pretokenization** ([`src/crouton/tokenizer/pretokenizer.py`](src/crouton/tokenizer/pretokenizer.py)): Hugging Face (HF) `Sequence` pretokenizer (`{"hf": ...}`) combining a Llama-3/cl100k-style regex `Split` (`behavior="Isolated"`) and `Digits(individual_digits=True)` (toggleable via `--no-individual-digits`).
-- **Training Corpus** ([`src/crouton/tokenizer/train_tokenizer.py`](src/crouton/tokenizer/train_tokenizer.py)): Streams 50,000 interleaved documents from `HuggingFaceFW/fineweb-edu` (`sample-10BT`) and `HuggingFaceTB/smollm-corpus` (`cosmopedia-v2`) by default (or `--local-file`), exporting a single HF JSON file when `--output` ends in `.json` (or a directory otherwise).
+- **Training Corpus** ([`src/crouton/tokenizer/train_tokenizer.py`](src/crouton/tokenizer/train_tokenizer.py)): Streams 50,000 interleaved documents from a 70/30 prose and code mix (`40% fineweb-edu-dedup`, `30% cosmopedia-v2`, `20% python-edu`, `10% codeparrot-clean`) by default (or `--local-file`), exporting a single HF JSON file when `--output` ends in `.json` (or a directory otherwise).
 
 ## Training & Post-Training Pipeline
 
@@ -116,7 +116,7 @@ python -m crouton.eval.eval_runner \
 
 ## SPLADE Backbone Adaptation (Experimental)
 
-`src/crouton/model/splade.py`, `src/crouton/train/splade.py`, and `src/crouton/eval/eval_splade.py` contain a small experimental test exploring how `crouton` adapts when used as a SPLADE sparse-retrieval backbone (switching to bidirectional attention with a short MNTP warmup and a tied SPLADE vocabulary head, plus a `--hf-baseline` flag for quick side-by-side BEIR checks). Full document retrieval benchmarks and broader SPLADE comparisons are intended to live in a separate repository.
+`src/crouton/model/splade.py`, `src/crouton/train/splade.py`, and `src/crouton/eval/eval_splade.py` contain an experimental SPLADE sparse-retrieval head and training loop for `crouton` (switching to bidirectional attention with MNTP warmup, a tied vocabulary head, and a `--hf-baseline` flag for quick BEIR checks). Full multi-domain retrieval benchmarks (BEIR and CoIR), ablations, and distillation experiments live in [sprinkles](https://github.com/Andy34G7/sprinkles).
 
 ## Verification & Testing
 
